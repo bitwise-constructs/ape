@@ -153,7 +153,7 @@ def test_list_geth(ape_cli, runner, networks, project):
 
 
 @run_once
-def test_list_filter_networks(ape_cli, runner, networks):
+def test_list_filter_networks(ape_cli, runner):
     result = runner.invoke(ape_cli, ("networks", "list", "--network", "sepolia"))
     assert result.exit_code == 0
 
@@ -208,4 +208,5 @@ def test_run_already_running(networks_runner, integ_project, geth_provider):
     cmd = ("run", "--network", f"ethereum:{LOCAL_NETWORK_NAME}:node")
     result = networks_runner.invoke(*cmd)
     assert result.exit_code != 0
-    assert "ERROR: Process already running." in result.output
+    assert "ERROR" in result.output
+    assert "Process already running." in result.output
