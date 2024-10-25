@@ -1,6 +1,5 @@
 from ape import plugins
-from ape.api import ForkedNetworkAPI, NetworkAPI, create_network_type
-from ape.api.networks import LOCAL_NETWORK_NAME
+from ape.api.networks import ForkedNetworkAPI, NetworkAPI, create_network_type
 
 from ._converters import WeiConversions
 from .ecosystem import (
@@ -50,7 +49,7 @@ def networks():
         yield "ethereum", f"{network_name}-fork", ForkedNetworkAPI
 
     # NOTE: This works for local providers, as they get chain_id from themselves
-    yield "ethereum", LOCAL_NETWORK_NAME, NetworkAPI
+    yield "ethereum", "local", NetworkAPI
 
 
 @plugins.register(plugins.QueryPlugin)

@@ -1,26 +1,43 @@
-from pathlib import Path
+from importlib import import_module
+from typing import Any
 
-from ape.utils import USER_AGENT, ManagerAccessMixin
 
-from .accounts import AccountManager
-from .chain import ChainManager
-from .compilers import CompilerManager
-from .config import ConfigManager
-from .converters import ConversionManager
-from .networks import NetworkManager
-from .plugins import PluginManager
-from .project import ProjectManager
-from .query import QueryManager
+def __getattr__(name: str) -> Any:
+    if name == "AccountManager":
+        module = import_module("ape.managers.accounts")
+        return module.AccountManager
 
-ManagerAccessMixin.plugin_manager = PluginManager()
-ManagerAccessMixin.config_manager = ConfigManager(
-    request_header={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
-)
-ManagerAccessMixin.compiler_manager = CompilerManager()
-ManagerAccessMixin.network_manager = NetworkManager()
-ManagerAccessMixin.query_manager = QueryManager()
-ManagerAccessMixin.conversion_manager = ConversionManager()
-ManagerAccessMixin.chain_manager = ChainManager()
-ManagerAccessMixin.account_manager = AccountManager()
-ManagerAccessMixin.local_project = ProjectManager(Path.cwd())
-ManagerAccessMixin.Project = ProjectManager
+    elif name == "ChainManager":
+        module = import_module("ape.managers.chain")
+        return module.ChainManager
+
+    elif name == "CompilerManager":
+        module = import_module("ape.managers.compilers")
+        return module.CompilerManager
+
+    elif name == "ConfigManager":
+        module = import_module("ape.managers.config")
+        return module.ConfigManager
+
+    elif name == "ConversionManager":
+        module = import_module("ape.managers.converters")
+        return module.ConversionManager
+
+    elif name == "NetworkManager":
+        module = import_module("ape.managers.networks")
+        return module.NetworkManager
+
+    elif name == "PluginManager":
+        module = import_module("ape.managers.plugins")
+        return module.PluginManager
+
+    elif name == "ProjectManager":
+        module = import_module("ape.managers.project")
+        return module.ProjectManager
+
+    elif name == "QueryManager":
+        module = import_module("ape.managers.query")
+        return module.QueryManager
+
+    else:
+        raise AttributeError(name)

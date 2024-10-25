@@ -30,7 +30,7 @@ from ape.logging import logger
 from ape.utils.os import expand_environment_variables
 
 if TYPE_CHECKING:
-    from ape.types import AddressType
+    from ape.types.address import AddressType
 
 
 EMPTY_BYTES32 = HexBytes("0x0000000000000000000000000000000000000000000000000000000000000000")
@@ -40,6 +40,7 @@ DEFAULT_LOCAL_TRANSACTION_ACCEPTANCE_TIMEOUT = 20
 DEFAULT_LIVE_NETWORK_BASE_FEE_MULTIPLIER = 1.4
 DEFAULT_TRANSACTION_TYPE = 0
 DEFAULT_MAX_RETRIES_TX = 20
+LOCAL_NETWORK_NAME = "local"
 SOURCE_EXCLUDE_PATTERNS = (
     ".build",
     ".cache",
@@ -531,6 +532,7 @@ __all__ = [
     "is_evm_precompile",
     "is_zero_hex",
     "load_config",
+    "LOCAL_NETWORK_NAME",
     "log_instead_of_fail",
     "nonreentrant",
     "raises_not_implemented",

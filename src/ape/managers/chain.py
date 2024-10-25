@@ -3,7 +3,7 @@ from collections import defaultdict
 from collections.abc import Collection, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from functools import partial
+from functools import partial, singledispatchmethod
 from pathlib import Path
 from statistics import mean, median
 from typing import IO, Optional, Union, cast
@@ -15,9 +15,9 @@ from rich.box import SIMPLE
 from rich.console import Console as RichConsole
 from rich.table import Table
 
-from ape.api import BlockAPI, ReceiptAPI
 from ape.api.address import BaseAddress
 from ape.api.networks import NetworkAPI, ProxyInfoAPI
+from ape.api.providers import BlockAPI
 from ape.api.query import (
     AccountTransactionQuery,
     BlockQuery,
@@ -26,6 +26,7 @@ from ape.api.query import (
     extract_fields,
     validate_and_expand_columns,
 )
+from ape.api.transactions import ReceiptAPI
 from ape.contracts import ContractContainer, ContractInstance
 from ape.exceptions import (
     APINotImplementedError,
@@ -40,15 +41,11 @@ from ape.exceptions import (
 )
 from ape.logging import get_rich_console, logger
 from ape.managers.base import BaseManager
-from ape.types import AddressType, GasReport, SnapshotID, SourceTraceback
-from ape.utils import (
-    BaseInterfaceModel,
-    is_evm_precompile,
-    is_zero_hex,
-    log_instead_of_fail,
-    nonreentrant,
-    singledispatchmethod,
-)
+from ape.types.address import AddressType
+from ape.types.trace import GasReport, SourceTraceback
+from ape.types.vm import SnapshotID
+from ape.utils.basemodel import BaseInterfaceModel
+from ape.utils.misc import is_evm_precompile, is_zero_hex, log_instead_of_fail, nonreentrant
 
 
 class BlockContainer(BaseManager):

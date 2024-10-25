@@ -6,10 +6,11 @@ from typing import TYPE_CHECKING
 from rich.box import SIMPLE
 from rich.table import Table
 
-from ape.utils import is_evm_precompile, is_zero_hex
+from ape.utils.misc import is_evm_precompile, is_zero_hex
 
 if TYPE_CHECKING:
-    from ape.types import ContractFunctionPath, CoverageReport, GasReport
+    from ape.types.coverage import CoverageReport
+    from ape.types.trace import ContractFunctionPath, GasReport
 
 USER_ASSERT_TAG = "USER_ASSERT"
 

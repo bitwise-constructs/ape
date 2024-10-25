@@ -5,6 +5,7 @@ import time
 import traceback
 from collections.abc import Collection, Iterable
 from functools import cached_property
+from importlib import import_module
 from inspect import getframeinfo, stack
 from pathlib import Path
 from types import CodeType, TracebackType
@@ -25,7 +26,9 @@ if TYPE_CHECKING:
     from ape.api.trace import TraceAPI
     from ape.api.transactions import ReceiptAPI, TransactionAPI
     from ape.managers.project import ProjectManager
-    from ape.types import AddressType, BlockID, SnapshotID, SourceTraceback
+    from ape.types.address import AddressType
+    from ape.types.trace import SourceTraceback
+    from ape.types.vm import BlockID, SnapshotID
 
 
 FailedTxn = Union["TransactionAPI", "ReceiptAPI"]
@@ -668,7 +671,7 @@ class SubprocessTimeoutError(SubprocessError):
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self._seconds in [None, ""]:
             return ""
 
@@ -918,7 +921,8 @@ def _get_custom_python_traceback(
     #  https://github.com/pallets/jinja/blob/main/src/jinja2/debug.py#L142
 
     if project is None:
-        from ape import project
+        access = import_module("ape.utils.basemodel").ManagerAccessMixin
+        project = access.local_project
 
     if not (base_path := getattr(project, "path", None)):
         # TODO: Add support for manifest-projects.
