@@ -1,29 +1,32 @@
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import click
 import pytest
 from _pytest._code.code import Traceback as PytestTraceback
 from rich import print as rich_print
 
-from ape.api.networks import ProviderContextManager
+from ape.exceptions import ConfigError
 from ape.logging import LogLevel
-from ape.pytest.config import ConfigWrapper
-from ape.pytest.coverage import CoverageTracker
-from ape.pytest.fixtures import ReceiptCapture
-from ape.pytest.gas import GasTracker
-from ape.types.coverage import CoverageReport
 from ape.utils.basemodel import ManagerAccessMixin
 from ape_console._cli import console
+
+if TYPE_CHECKING:
+    from ape.api.networks import ProviderContextManager
+    from ape.pytest.config import ConfigWrapper
+    from ape.pytest.coverage import CoverageTracker
+    from ape.pytest.fixtures import ReceiptCapture
+    from ape.pytest.gas import GasTracker
+    from ape.types.coverage import CoverageReport
 
 
 class PytestApeRunner(ManagerAccessMixin):
     def __init__(
         self,
-        config_wrapper: ConfigWrapper,
-        receipt_capture: ReceiptCapture,
-        gas_tracker: GasTracker,
-        coverage_tracker: CoverageTracker,
+        config_wrapper: "ConfigWrapper",
+        receipt_capture: "ReceiptCapture",
+        gas_tracker: "GasTracker",
+        coverage_tracker: "CoverageTracker",
     ):
         self.config_wrapper = config_wrapper
         self.receipt_capture = receipt_capture
@@ -35,11 +38,11 @@ class PytestApeRunner(ManagerAccessMixin):
         self.coverage_tracker = coverage_tracker
 
     @property
-    def _provider_context(self) -> ProviderContextManager:
+    def _provider_context(self) -> "ProviderContextManager":
         return self.network_manager.parse_network_choice(self.config_wrapper.network)
 
     @property
-    def _coverage_report(self) -> Optional[CoverageReport]:
+    def _coverage_report(self) -> Optional["CoverageReport"]:
         return self.coverage_tracker.data.report if self.coverage_tracker.data else None
 
     def pytest_exception_interact(self, report, call):
@@ -206,8 +209,24 @@ class PytestApeRunner(ManagerAccessMixin):
 
         # Only start provider if collected tests.
         if not outcome.get_result() and session.items:
-            self._provider_context.push_provider()
-            self._provider_is_connected = True
+            self._connect()
+
+    def _connect(self):
+        if self._provider_context._provider.network.is_mainnet:
+            # Ensure is not only running on tests on mainnet because
+            # was configured as the default.
+            is_from_command_line = (
+                "--network" in self.config_wrapper.pytest_config.invocation_params.args
+            )
+            if not is_from_command_line:
+                raise ConfigError(
+                    "Default network is mainnet; unable to run tests on mainnet. "
+                    "Please specify the network using the `--network` flag or "
+                    "configure a different default network."
+                )
+
+        self._provider_context.push_provider()
+        self._provider_is_connected = True
 
     def pytest_terminal_summary(self, terminalreporter):
         """

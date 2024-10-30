@@ -1,8 +1,7 @@
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from ape.api.networks import EcosystemAPI
 from ape.exceptions import ConfigError
 from ape.pytest.config import ConfigWrapper
 from ape.pytest.coverage import CoverageTracker
@@ -11,19 +10,13 @@ from ape.pytest.gas import GasTracker
 from ape.pytest.runners import PytestApeRunner
 from ape.utils.basemodel import ManagerAccessMixin
 
+if TYPE_CHECKING:
+    from ape.api.networks import EcosystemAPI
 
-def _get_default_network(ecosystem: Optional[EcosystemAPI] = None) -> str:
+
+def _get_default_network(ecosystem: Optional["EcosystemAPI"] = None) -> str:
     if ecosystem is None:
         ecosystem = ManagerAccessMixin.network_manager.default_ecosystem
-
-    if ecosystem.default_network.is_mainnet:
-        # Don't use mainnet for tests, even if it configured as
-        # the default.
-        raise ConfigError(
-            "Default network is mainnet; unable to run tests on mainnet. "
-            "Please specify the network using the `--network` flag or "
-            "configure a different default network."
-        )
 
     return ecosystem.name
 
