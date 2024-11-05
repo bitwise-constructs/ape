@@ -26,7 +26,6 @@ from web3.exceptions import (
     MethodUnavailable,
     TimeExhausted,
     TransactionNotFound,
-    Web3RPCError,
 )
 from web3.gas_strategies.rpc import rpc_gas_price_strategy
 from web3.middleware import ExtraDataToPOAMiddleware
@@ -1033,7 +1032,7 @@ class Web3Provider(ProviderAPI, ABC):
             if txn_hash is None:
                 txn_hash = to_hex(self.web3.eth.send_raw_transaction(txn.serialize_transaction()))
 
-        except (ValueError, Web3ContractLogicError, Web3RPCError) as err:
+        except (ValueError, Web3ContractLogicError) as err:
             vm_err = self.get_virtual_machine_error(
                 err, txn=txn, set_ape_traceback=txn.raise_on_revert
             )
@@ -1325,7 +1324,7 @@ class EthereumNodeProvider(Web3Provider, ABC):
     name: str = "node"
 
     # NOTE: Appends user-agent to base User-Agent string.
-    request_header: dict = HTTPProvider.get_request_headers()
+    request_header: dict = {}
 
     @property
     def uri(self) -> str:

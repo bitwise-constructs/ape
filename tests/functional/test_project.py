@@ -209,8 +209,15 @@ def test_getattr(tmp_project):
 
 
 def test_getattr_not_exists(tmp_project):
-    with pytest.raises(AttributeError):
+    expected = (
+        r"'LocalProject' object has no attribute 'nope'\. Also checked extra\(s\) 'contracts'\."
+    )
+    with pytest.raises(AttributeError, match=expected) as err:
         _ = tmp_project.nope
+
+    # Was the case where the last entry was from Ape's basemodel stuff.
+    # Now, it points at the project manager last.
+    assert "ape/managers/project.py:" in repr(err.traceback[-1])
 
 
 def test_getattr_detects_changes(tmp_project):
@@ -680,9 +687,10 @@ class TestProject:
 
             os.chdir(temp_dir)
             expected = r"[.\n]*Input should be a valid string\n-->1: name:\n   2:   {asdf}[.\n]*"
+            weird_project = Project(temp_dir)
             try:
                 with pytest.raises(ConfigError, match=expected):
-                    _ = Project(temp_dir)
+                    _ = weird_project.path
             finally:
                 os.chdir(here)
 

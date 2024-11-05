@@ -9,7 +9,6 @@ from rich import print as rich_print
 from ape.exceptions import ConfigError
 from ape.logging import LogLevel
 from ape.utils.basemodel import ManagerAccessMixin
-from ape_console._cli import console
 
 if TYPE_CHECKING:
     from ape.api.networks import ProviderContextManager
@@ -72,17 +71,26 @@ class PytestApeRunner(ManagerAccessMixin):
             # Else, it gets way too noisy.
             show_locals = not self.config_wrapper.show_internal
 
-            report.longrepr = call.excinfo.getrepr(
-                funcargs=True,
-                abspath=Path.cwd(),
-                showlocals=show_locals,
-                style="short",
-                tbfilter=False,
-                truncate_locals=True,
-                chain=False,
-            )
+            try:
+                here = Path.cwd()
+
+            except FileNotFoundError:
+                pass  # In a temp-folder, most likely.
+
+            else:
+                report.longrepr = call.excinfo.getrepr(
+                    funcargs=True,
+                    abspath=here,
+                    showlocals=show_locals,
+                    style="short",
+                    tbfilter=False,
+                    truncate_locals=True,
+                    chain=False,
+                )
 
         if self.config_wrapper.interactive and report.failed:
+            from ape_console._cli import console
+
             traceback = call.excinfo.traceback[-1]
 
             # Suspend capsys to ignore our own output.
@@ -117,6 +125,7 @@ class PytestApeRunner(ManagerAccessMixin):
             click.echo("Starting interactive mode. Type `exit` to halt current test.")
 
             namespace = {"_callinfo": call, **globals_dict, **locals_dict}
+
             console(extra_locals=namespace, project=self.local_project, embed=True)
 
             if capman:
