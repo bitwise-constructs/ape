@@ -12,6 +12,7 @@ from eth_account._utils.signing import (
 )
 from eth_pydantic_types import HexBytes
 from eth_utils import keccak, to_int
+from evmchains import PUBLIC_CHAIN_META
 from pydantic import model_validator
 
 from ape.exceptions import (
@@ -109,7 +110,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         """
         return self.config_manager.DATA_FOLDER / self.name
 
-    @cached_property
+    @property
     def custom_network(self) -> "NetworkAPI":
         """
         A :class:`~ape.api.networks.NetworkAPI` for custom networks where the
@@ -125,13 +126,11 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         if ethereum_class is None:
             raise NetworkError("Core Ethereum plugin missing.")
 
-        request_header = self.config_manager.REQUEST_HEADER
-        init_kwargs = {"name": "ethereum", "request_header": request_header}
-        ethereum = ethereum_class(**init_kwargs)  # type: ignore
+        init_kwargs = {"name": "ethereum"}
+        evm_ecosystem = ethereum_class(**init_kwargs)  # type: ignore
         return NetworkAPI(
             name="custom",
-            ecosystem=ethereum,
-            request_header=request_header,
+            ecosystem=evm_ecosystem,
             _default_provider="node",
             _is_custom=True,
         )
@@ -301,6 +300,11 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
             network_api._is_custom = True
             networks[net_name] = network_api
 
+        # Add any remaining networks from EVM chains here (but don't override).
+        # NOTE: Only applicable to EVM-based ecosystems, of course.
+        #   Otherwise, this is a no-op.
+        networks = {**self._networks_from_evmchains, **networks}
+
         return networks
 
     @cached_property
@@ -310,6 +314,33 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
             for _, (ecosystem_name, network_name, network_class) in self.plugin_manager.networks
             if ecosystem_name == self.name
         }
+
+    @cached_property
+    def _networks_from_evmchains(self) -> dict[str, "NetworkAPI"]:
+        # NOTE: Purposely exclude plugins here so we also prefer plugins.
+        networks = {
+            network_name: create_network_type(data["chainId"], data["chainId"])(
+                name=network_name, ecosystem=self
+            )
+            for network_name, data in PUBLIC_CHAIN_META.get(self.name, {}).items()
+            if network_name not in self._networks_from_plugins
+        }
+        forked_networks: dict[str, ForkedNetworkAPI] = {}
+        for network_name, network in networks.items():
+            if network_name.endswith("-fork"):
+                # Already a fork.
+                continue
+
+            fork_network_name = f"{network_name}-fork"
+            if any(x == fork_network_name for x in networks):
+                # The forked version of this network is already known.
+                continue
+
+            forked_networks[fork_network_name] = ForkedNetworkAPI(
+                name=fork_network_name, ecosystem=self
+            )
+
+        return {**networks, **forked_networks}
 
     def __post_init__(self):
         if len(self.networks) == 0:
@@ -520,7 +551,6 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         Returns:
           :class:`~ape.api.networks.NetworkAPI`
         """
-
         names = {network_name, network_name.replace("-", "_"), network_name.replace("_", "-")}
         networks = self.networks
         for name in names:
@@ -1057,7 +1087,6 @@ class NetworkAPI(BaseInterfaceModel):
         Returns:
             dict[str, partial[:class:`~ape.api.providers.ProviderAPI`]]
         """
-
         from ape.plugins._utils import clean_plugin_name
 
         providers = {}
@@ -1088,6 +1117,12 @@ class NetworkAPI(BaseInterfaceModel):
                     name=provider_name,
                     network=self,
                 )
+
+        # Any EVM-chain works with node provider.
+        if "node" not in providers and self.name in self.ecosystem._networks_from_evmchains:
+            # NOTE: Arbitrarily using sepolia to access the Node class.
+            node_provider_cls = self.network_manager.ethereum.sepolia.get_provider("node").__class__
+            providers["node"] = partial(node_provider_cls, name="node", network=self)
 
         return providers
 
