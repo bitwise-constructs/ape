@@ -44,7 +44,7 @@ extras_require = {
     ],
     "doc": ["sphinx-ape"],
     "release": [  # `release` GitHub Action job uses this
-        "setuptools",  # Installation tool
+        "setuptools>=75",  # Installation tool
         "wheel",  # Packaging tool
         "twine==3.8.0",  # Package upload tool
     ],
@@ -98,12 +98,14 @@ setup(
         "ijson>=3.1.4,<4",
         "ipython>=8.18.1,<9",
         "lazyasd>=0.1.4",
+        "asttokens>=2.4.1,<3",  # Peer dependency; w/o pin container build fails.
+        "cchecksum>=0.0.3,<1",
         # Pandas peer-dep: Numpy 2.0 causes issues for some users.
         "numpy<2",
         "packaging>=23.0,<24",
         "pandas>=2.2.2,<3",
         "pluggy>=1.3,<2",
-        "pydantic>=2.6.4,<3",
+        "pydantic>=2.10.0,<3",
         "pydantic-settings>=2.5.2,<3",
         "pytest>=8.0,<9.0",
         "python-dateutil>=2.8.2,<3",
@@ -118,17 +120,17 @@ setup(
         "watchdog>=3.0,<4",
         # ** Dependencies maintained by Ethereum Foundation **
         "eth-abi>=5.1.0,<6",
-        "eth-account>=0.13.3,<0.14",
-        "eth-tester>=0.12.0b1",
-        "eth-typing>=5.0.0,<6",
-        "eth-utils>=5.0.0,<6",
+        "eth-account>=0.13.4,<0.14",
+        "eth-tester>=0.12.0b2,<0.13",  # Peer: stricter pin needed for [tester].
+        "eth-typing>=5.0.1,<6",
+        "eth-utils>=5.1.0,<6",
         "hexbytes>=1.2.1,<2",
-        "py-geth>=5.0.0,<6",
-        "trie>=3.0.1,<4",
-        "web3>=7.2.0,<8",
+        "py-geth>=5.1.0,<6",
+        "trie>=3.0.1,<4",  # Peer: stricter pin needed for uv support.
+        "web3[tester]>=7.6.0,<8",
         # ** Dependencies maintained by ApeWorX **
         "eip712>=0.2.10,<0.3",
-        "ethpm-types>=0.6.17,<0.7",
+        "ethpm-types>=0.6.19,<0.7",
         "eth_pydantic_types>=0.1.3,<0.2",
         "evmchains>=0.1.0,<0.2",
         "evm-trace>=0.2.3,<0.3",
@@ -170,5 +172,6 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
 )

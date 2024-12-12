@@ -47,6 +47,7 @@ def pytest_addoption(parser):
         help="A comma-separated list of contract:method-name glob-patterns to ignore.",
     )
     add_option("--coverage", action="store_true", help="Collect contract coverage.")
+    add_option("--project", action="store", help="Change Ape's project")
 
     # NOTE: Other pytest plugins, such as hypothesis, should integrate with pytest separately
 
@@ -68,35 +69,47 @@ def pytest_configure(config):
                 except AttributeError:
                     pass
 
-    if not config.option.verbose:
-        # Enable verbose output if stdout capture is disabled
-        config.option.verbose = config.getoption("capture") == "no"
-    # else: user has already changes verbosity to an equal or higher level; avoid downgrading.
-
     if "--help" in config.invocation_params.args:
         # perf: Don't bother setting up runner if only showing help.
         return
 
     from ape.pytest.config import ConfigWrapper
     from ape.pytest.coverage import CoverageTracker
-    from ape.pytest.fixtures import PytestApeFixtures, ReceiptCapture
+    from ape.pytest.fixtures import (
+        FixtureManager,
+        IsolationManager,
+        PytestApeFixtures,
+        ReceiptCapture,
+    )
     from ape.pytest.gas import GasTracker
     from ape.pytest.runners import PytestApeRunner
     from ape.utils.basemodel import ManagerAccessMixin
 
+    if project := config.getoption("--project"):
+        ManagerAccessMixin.local_project.chdir(project)
+
     # Register the custom Ape test runner
     config_wrapper = ConfigWrapper(config)
     receipt_capture = ReceiptCapture(config_wrapper)
+    isolation_manager = IsolationManager(config_wrapper, receipt_capture)
+    fixture_manager = FixtureManager(config_wrapper, isolation_manager)
     gas_tracker = GasTracker(config_wrapper)
     coverage_tracker = CoverageTracker(config_wrapper)
-    runner = PytestApeRunner(config_wrapper, receipt_capture, gas_tracker, coverage_tracker)
+    runner = PytestApeRunner(
+        config_wrapper,
+        isolation_manager,
+        receipt_capture,
+        gas_tracker,
+        coverage_tracker,
+        fixture_manager=fixture_manager,
+    )
     config.pluginmanager.register(runner, "ape-test")
 
     # Inject runner for access to gas and coverage trackers.
     ManagerAccessMixin._test_runner = runner
 
     # Include custom fixtures for project, accounts etc.
-    fixtures = PytestApeFixtures(config_wrapper, receipt_capture)
+    fixtures = PytestApeFixtures(config_wrapper, isolation_manager)
     config.pluginmanager.register(fixtures, "ape-fixtures")
 
     # Add custom markers

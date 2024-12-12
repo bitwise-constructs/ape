@@ -257,11 +257,7 @@ class ContractMethodHandler(ManagerAccessMixin):
 
     def _validate_is_contract(self):
         if not self.contract.is_contract:
-            raise ContractNotFoundError(
-                self.contract.address,
-                self.provider.network.explorer is not None,
-                self.provider.network_choice,
-            )
+            raise ContractNotFoundError(self.contract.address, provider=self.provider)
 
 
 class ContractCallHandler(ContractMethodHandler):
@@ -649,7 +645,7 @@ class ContractEvent(BaseInterfaceModel):
                 f"the chain length ({self.chain_manager.blocks.height})."
             )
         query: dict = {
-            "columns": list(ContractLog.model_fields) if columns[0] == "*" else columns,
+            "columns": list(ContractLog.__pydantic_fields__) if columns[0] == "*" else columns,
             "event": self.abi,
             "start_block": start_block,
             "stop_block": stop_block,
@@ -720,7 +716,7 @@ class ContractEvent(BaseInterfaceModel):
 
         addresses = list(set([contract_address] + (extra_addresses or [])))
         contract_event_query = ContractEventQuery(
-            columns=list(ContractLog.model_fields.keys()),
+            columns=list(ContractLog.__pydantic_fields__),
             contract=addresses,
             event=self.abi,
             search_topics=search_topics,
@@ -1407,7 +1403,10 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
         return self.chain_manager.contracts.get_deployments(self)
 
     def at(
-        self, address: "AddressType", txn_hash: Optional[Union[str, HexBytes]] = None
+        self,
+        address: "AddressType",
+        txn_hash: Optional[Union[str, HexBytes]] = None,
+        fetch_from_explorer: bool = True,
     ) -> ContractInstance:
         """
         Get a contract at the given address.
@@ -1425,13 +1424,16 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
               a different ABI than :attr:`~ape.contracts.ContractContainer.contract_type`.
             txn_hash (Union[str, HexBytes]): The hash of the transaction that deployed the
               contract, if available. Defaults to ``None``.
+            fetch_from_explorer (bool): Set to ``False`` to avoid fetching from an explorer.
 
         Returns:
             :class:`~ape.contracts.ContractInstance`
         """
-
         return self.chain_manager.contracts.instance_at(
-            address, self.contract_type, txn_hash=txn_hash
+            address,
+            self.contract_type,
+            txn_hash=txn_hash,
+            fetch_from_explorer=fetch_from_explorer,
         )
 
     @cached_property

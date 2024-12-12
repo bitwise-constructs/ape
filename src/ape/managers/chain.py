@@ -28,6 +28,7 @@ from ape.api.transactions import ReceiptAPI
 from ape.contracts import ContractContainer, ContractInstance
 from ape.exceptions import (
     APINotImplementedError,
+    BlockNotFoundError,
     ChainError,
     ContractNotFoundError,
     ConversionError,
@@ -75,10 +76,15 @@ class BlockContainer(BaseManager):
         """
         The latest block number.
         """
-        if self.head.number is None:
+        try:
+            head = self.head
+        except BlockNotFoundError:
+            return 0
+
+        if head.number is None:
             raise ChainError("Latest block has no number.")
 
-        return self.head.number
+        return head.number
 
     @property
     def network_confirmations(self) -> int:
@@ -433,7 +439,7 @@ class AccountHistory(BaseInterfaceModel):
                 next(
                     self.query_manager.query(
                         AccountTransactionQuery(
-                            columns=list(ReceiptAPI.model_fields),
+                            columns=list(ReceiptAPI.__pydantic_fields__),
                             account=self.address,
                             start_nonce=index,
                             stop_nonce=index,
@@ -471,7 +477,7 @@ class AccountHistory(BaseInterfaceModel):
             list(
                 self.query_manager.query(
                     AccountTransactionQuery(
-                        columns=list(ReceiptAPI.model_fields),
+                        columns=list(ReceiptAPI.__pydantic_fields__),
                         account=self.address,
                         start_nonce=start,
                         stop_nonce=stop - 1,
@@ -966,9 +972,7 @@ class ContractCache(BaseManager):
         contract_type = self.get(address)
         if not contract_type:
             # Create error message from custom exception cls.
-            err = ContractNotFoundError(
-                address, self.provider.network.explorer is not None, self.provider.network_choice
-            )
+            err = ContractNotFoundError(address, provider=self.provider)
             # Must raise KeyError.
             raise KeyError(str(err))
 
@@ -1029,7 +1033,10 @@ class ContractCache(BaseManager):
 
     @nonreentrant(key_fn=lambda *args, **kwargs: args[1])
     def get(
-        self, address: AddressType, default: Optional[ContractType] = None
+        self,
+        address: AddressType,
+        default: Optional[ContractType] = None,
+        fetch_from_explorer: bool = True,
     ) -> Optional[ContractType]:
         """
         Get a contract type by address.
@@ -1041,6 +1048,9 @@ class ContractCache(BaseManager):
             address (AddressType): The address of the contract.
             default (Optional[ContractType]): A default contract when none is found.
               Defaults to ``None``.
+            fetch_from_explorer (bool): Set to ``False`` to avoid fetching from an
+              explorer. Defaults to ``True``. Only fetches if it needs to (uses disk
+              & memory caching otherwise).
 
         Returns:
             Optional[ContractType]: The contract type if it was able to get one,
@@ -1095,7 +1105,8 @@ class ContractCache(BaseManager):
                 return default
 
             # Also gets cached to disk for faster lookup next time.
-            contract_type = self._get_contract_type_from_explorer(address_key)
+            if fetch_from_explorer:
+                contract_type = self._get_contract_type_from_explorer(address_key)
 
         # Cache locally for faster in-session look-up.
         if contract_type:
@@ -1136,6 +1147,7 @@ class ContractCache(BaseManager):
         contract_type: Optional[ContractType] = None,
         txn_hash: Optional[Union[str, "HexBytes"]] = None,
         abi: Optional[Union[list[ABI], dict, str, Path]] = None,
+        fetch_from_explorer: bool = True,
     ) -> ContractInstance:
         """
         Get a contract at the given address. If the contract type of the contract is known,
@@ -1157,6 +1169,9 @@ class ContractCache(BaseManager):
               deploying the contract, if known. Useful for publishing. Defaults to ``None``.
             abi (Optional[Union[list[ABI], dict, str, Path]]): Use an ABI str, dict, path,
               or ethpm models to create a contract instance class.
+            fetch_from_explorer (bool): Set to ``False`` to avoid fetching from the explorer.
+              Defaults to ``True``. Won't fetch unless it needs to (uses disk & memory caching
+              first).
 
         Returns:
             :class:`~ape.contracts.base.ContractInstance`
@@ -1172,7 +1187,9 @@ class ContractCache(BaseManager):
 
         try:
             # Always attempt to get an existing contract type to update caches
-            contract_type = self.get(contract_address, default=contract_type)
+            contract_type = self.get(
+                contract_address, default=contract_type, fetch_from_explorer=fetch_from_explorer
+            )
         except Exception as err:
             if contract_type or abi:
                 # If a default contract type was provided, don't error and use it.
@@ -1223,11 +1240,7 @@ class ContractCache(BaseManager):
                 )
 
         if not contract_type:
-            raise ContractNotFoundError(
-                contract_address,
-                self.provider.network.explorer is not None,
-                self.provider.network_choice,
-            )
+            raise ContractNotFoundError(contract_address, provider=self.provider)
 
         elif not isinstance(contract_type, ContractType):
             raise TypeError(

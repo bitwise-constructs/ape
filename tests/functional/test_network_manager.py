@@ -254,6 +254,38 @@ def test_getattr_custom_ecosystem(networks, custom_networks_config_dict, project
         assert isinstance(actual, EcosystemAPI)
 
 
+def test_getattr_plugin_ecosystem_same_as_evm_chains(mocker, networks):
+    """
+    Simulated having a plugin ecosystem installed.
+    """
+    optimismy = mocker.MagicMock()
+    networks._plugin_ecosystems["optimismy"] = optimismy
+    actual = networks.optimismy
+    del networks._plugin_ecosystems["optimismy"]
+    assert actual == optimismy
+
+
+def test_getattr_evm_chains_ecosystem(networks):
+    """
+    Show we can getattr evm-chains only ecosystems.
+    """
+    actual = networks.moonbeam
+    assert actual.name == "moonbeam"
+
+
+def test_getattr_plugin_ecosystem_same_name_as_evm_chains(mocker, networks):
+    """
+    Show when an ecosystem is both in evm-chains and an installed plugin
+    that Ape prefers the installed plugin.
+    """
+    moonbeam_plugin = mocker.MagicMock()
+    networks._plugin_ecosystems["moonbeam"] = moonbeam_plugin
+    actual = networks.moonbeam
+    del networks._plugin_ecosystems["moonbeam"]
+    assert actual == moonbeam_plugin
+    assert actual != networks._evmchains_ecosystems["moonbeam"]
+
+
 @pytest.mark.parametrize("scheme", ("http", "https"))
 def test_create_custom_provider_http(networks, scheme):
     provider = networks.create_custom_provider(f"{scheme}://example.com")
@@ -351,6 +383,12 @@ def test_fork(networks, mock_sepolia, mock_fork_provider):
     with ctx as provider:
         assert provider.name == "mock"
         assert provider.network.name == "sepolia-fork"
+        # Fork the fork.
+        ctx2 = networks.fork()
+        with ctx2 as provider2:
+            assert provider2.partial_call[1]["provider_settings"]["host"] == "auto"
+            assert provider2.name == "mock"
+            assert provider2.network.name == "sepolia-fork"
 
 
 def test_fork_specify_provider(networks, mock_sepolia, mock_fork_provider):
