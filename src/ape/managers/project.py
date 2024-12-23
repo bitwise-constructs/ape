@@ -44,7 +44,7 @@ from ape.utils.os import (
 
 
 def _path_to_source_id(path: Path, root_path: Path) -> str:
-    return f"{path.relative_to(root_path)}"
+    return f"{path.relative_to(root_path).as_posix()}"
 
 
 class SourceManager(BaseManager):
