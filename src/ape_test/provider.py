@@ -2,6 +2,7 @@ import re
 from ast import literal_eval
 from collections.abc import Iterator
 from functools import cached_property
+from pathlib import Path
 from re import Pattern
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -35,6 +36,7 @@ from ape.utils.misc import gas_estimation_error_message
 from ape.utils.testing import DEFAULT_TEST_HD_PATH
 from ape_ethereum.provider import Web3Provider
 from ape_ethereum.trace import TraceApproach, TransactionTrace
+from ape_ethereum.transactions import TransactionStatusEnum
 from ape_test.config import EthTesterProviderConfig
 
 if TYPE_CHECKING:
@@ -180,6 +182,18 @@ class LocalProvider(TestProviderAPI, Web3Provider):
     @property
     def max_gas(self) -> int:
         return self.evm_backend.get_block_by_number("latest")["gas_limit"]
+
+    @property
+    def http_uri(self) -> Optional[str]:
+        return None
+
+    @property
+    def ws_uri(self) -> Optional[str]:
+        return None
+
+    @property
+    def ipc_path(self) -> Optional[Path]:
+        return None
 
     def connect(self):
         self.__dict__.pop("tester", None)
@@ -341,17 +355,26 @@ class LocalProvider(TestProviderAPI, Web3Provider):
                 txn_hash = to_hex(txn.txn_hash)
 
         required_confirmations = txn.required_confirmations or 0
-        if vm_err:
-            receipt = self._create_receipt(
-                required_confirmations=required_confirmations, error=vm_err, txn_hash=txn_hash
-            )
+        txn_dict = txn_dict or txn.model_dump(mode="json")
+
+        # Signature is typically excluded from the model fields,
+        # so we have to include it manually.
+        txn_dict["signature"] = txn.signature
+
+        if vm_err or not self.auto_mine:
+            receipt_data = {
+                **txn_dict,
+                "block_number": -1,  # Not yet confirmed,
+                "error": vm_err,
+                "provider": self,
+                "required_confirmations": required_confirmations,
+                "status": (
+                    TransactionStatusEnum.FAILING if vm_err else TransactionStatusEnum.NO_ERROR
+                ),
+                "txn_hash": txn_hash,
+            }
+            receipt = self.network.ecosystem.decode_receipt(receipt_data)
         else:
-            txn_dict = txn_dict or txn.model_dump(mode="json")
-
-            # Signature is typically excluded from the model fields,
-            # so we have to include it manually.
-            txn_dict["signature"] = txn.signature
-
             receipt = self.get_receipt(
                 txn_hash, required_confirmations=required_confirmations, transaction=txn_dict
             )
@@ -360,9 +383,6 @@ class LocalProvider(TestProviderAPI, Web3Provider):
         self.chain_manager.history.append(receipt)
 
         if receipt.failed:
-            # NOTE: Using JSON mode since used as request data.
-            txn_dict = txn_dict or txn.model_dump(mode="json")
-
             txn_dict["nonce"] += 1
             txn_params = cast(TxParams, txn_dict)
             txn_dict.pop("signature", None)

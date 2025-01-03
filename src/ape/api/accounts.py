@@ -18,6 +18,7 @@ from ape.api.transactions import ReceiptAPI, TransactionAPI
 from ape.exceptions import (
     AccountsError,
     AliasAlreadyInUseError,
+    ConversionError,
     MethodNonPayableError,
     MissingDeploymentBytecodeError,
     SignatureError,
@@ -220,8 +221,18 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
         Returns:
             :class:`~ape.api.transactions.ReceiptAPI`
         """
+        if isinstance(account, int):
+            raise AccountsError(
+                "Cannot use integer-type for the `receiver` argument in the "
+                "`.transfer()` method (this protects against accidentally passing "
+                "the `value` as the `receiver`)."
+            )
 
-        receiver = self.conversion_manager.convert(account, AddressType)
+        try:
+            receiver = self.conversion_manager.convert(account, AddressType)
+        except ConversionError as err:
+            raise AccountsError(f"Invalid `receiver` value: '{account}'.") from err
+
         txn = self.provider.network.ecosystem.create_transaction(
             sender=self.address, receiver=receiver, **kwargs
         )
@@ -415,6 +426,28 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
             )
 
         return txn
+
+    def get_deployment_address(self, nonce: Optional[int] = None) -> AddressType:
+        """
+        Get a contract address before it is deployed. This is useful
+        when you need to pass the contract address to another contract
+        before deploying it.
+
+        Args:
+            nonce (int | None): Optionally provide a nonce. Defaults
+              the account's current nonce.
+
+        Returns:
+            AddressType: The contract address.
+        """
+        # Use the connected network, if available. Else, default to Ethereum.
+        ecosystem = (
+            self.network_manager.active_provider.network.ecosystem
+            if self.network_manager.active_provider
+            else self.network_manager.ethereum
+        )
+        nonce = self.nonce if nonce is None else nonce
+        return ecosystem.get_deployment_address(self.address, nonce)
 
 
 class AccountContainerAPI(BaseInterfaceModel):

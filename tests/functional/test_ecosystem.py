@@ -630,6 +630,12 @@ def test_decode_receipt_shared_blob(ethereum, blob_gas_used, blob_gas_key):
         # when None, should also default to 0.
         assert actual.blob_gas_used == 0
 
+    # Show type=3 is required.
+    data["type"] = 2
+    actual = ethereum.decode_receipt(data)
+    assert not isinstance(actual, SharedBlobReceipt)
+    assert isinstance(actual, Receipt)
+
 
 def test_decode_receipt_misleading_blob_receipt(ethereum):
     """
@@ -1197,3 +1203,9 @@ def test_enrich_trace_handles_events(ethereum, vyper_contract_instance, owner):
         }
     ]
     assert events == expected
+
+
+def test_get_deployment_address(ethereum, owner, vyper_contract_container):
+    actual = ethereum.get_deployment_address(owner.address, owner.nonce)
+    expected = owner.deploy(vyper_contract_container, 490)
+    assert actual == expected

@@ -240,6 +240,27 @@ def test_transfer_value_of_0(sender, receiver):
     assert receiver.balance == initial_balance
 
 
+def test_transfer_mixed_up_sender_and_value(sender, receiver):
+    """
+    Testing the case where the user mixes up the argument order,
+    it should show a nicer error than it was previously, as this is
+    a common and easy mistake.
+    """
+    expected = (
+        r"Cannot use integer-type for the `receiver` "
+        r"argument in the `\.transfer\(\)` method \(this "
+        r"protects against accidentally passing the "
+        r"`value` as the `receiver`\)."
+    )
+    with pytest.raises(AccountsError, match=expected):
+        sender.transfer(123, receiver)
+
+    # Similarly show using currency-str (may fail for different error).
+    expected = r"Invalid `receiver` value: '123 wei'\."
+    with pytest.raises(AccountsError, match=expected):
+        sender.transfer("123 wei", receiver)
+
+
 def test_deploy(owner, contract_container, clean_contract_caches):
     contract = owner.deploy(contract_container, 0)
     assert contract.address
@@ -921,3 +942,12 @@ def test_import_account_from_private_key_insecure_passphrase(delete_account_afte
 def test_load(account_manager, keyfile_account):
     account = account_manager.load(keyfile_account.alias)
     assert account == keyfile_account
+
+
+def test_get_deployment_address(owner, vyper_contract_container):
+    deployment_address_1 = owner.get_deployment_address()
+    deployment_address_2 = owner.get_deployment_address(nonce=owner.nonce + 1)
+    instance_1 = owner.deploy(vyper_contract_container, 490)
+    assert instance_1.address == deployment_address_1
+    instance_2 = owner.deploy(vyper_contract_container, 490)
+    assert instance_2.address == deployment_address_2

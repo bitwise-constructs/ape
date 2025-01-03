@@ -4,6 +4,7 @@ from decimal import Decimal
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union, cast
 
+import rlp  # type: ignore
 from cchecksum import to_checksum_address
 from eth_abi import decode, encode
 from eth_abi.exceptions import InsufficientDataBytes, NonEmptyPaddingBytes
@@ -34,7 +35,6 @@ from ape.exceptions import (
     ConversionError,
     CustomError,
     DecodingError,
-    ProviderError,
     SignatureError,
 )
 from ape.logging import logger
@@ -589,29 +589,14 @@ class Ethereum(EcosystemAPI):
         }
 
         receipt_cls: type[Receipt]
-        if any(
-            x in data
-            for x in (
-                "blobGasPrice",
-                "blobGasUsed",
-                "blobVersionedHashes",
-                "maxFeePerBlobGas",
-                "blob_gas_price",
-                "blob_gas_used",
-            )
-        ):
-            blob_gas_price = data.get("blob_gas_price", data.get("blobGasPrice"))
+        if data.get("type") == 3:
+            receipt_cls = SharedBlobReceipt
+            blob_gas_price = data.get("blob_gas_price")
             if blob_gas_price is None:
-                # Not actually a blob-receipt? Some providers may give you
-                # empty values here when meaning the other types of receipts.
-                receipt_cls = Receipt
+                blob_gas_price = data.get("blobGasPrice")
 
-            else:
-                receipt_cls = SharedBlobReceipt
-                receipt_kwargs["blobGasPrice"] = blob_gas_price
-                receipt_kwargs["blobGasUsed"] = (
-                    data.get("blob_gas_used", data.get("blobGasUsed")) or 0
-                )
+            receipt_kwargs["blobGasPrice"] = blob_gas_price
+            receipt_kwargs["blobGasUsed"] = data.get("blob_gas_used", data.get("blobGasUsed")) or 0
 
         else:
             receipt_cls = Receipt
@@ -1473,7 +1458,7 @@ class Ethereum(EcosystemAPI):
         try:
             if not (last_addr := next(trace.get_addresses_used(reverse=True), None)):
                 return None
-        except ProviderError:
+        except Exception:
             # When unable to get trace-frames properly, such as eth-tester.
             return None
 
@@ -1490,6 +1475,17 @@ class Ethereum(EcosystemAPI):
 
         # error never found.
         return None
+
+    def get_deployment_address(self, address: AddressType, nonce: int) -> AddressType:
+        """
+        Calculate the deployment address of a contract before it is deployed.
+        This is useful if the address is an argument to another contract's deployment
+        and you have not yet deployed the first contract yet.
+        """
+        sender_bytes = to_bytes(hexstr=address)
+        encoded = rlp.encode([sender_bytes, nonce])
+        address_bytes = keccak(encoded)[12:]
+        return self.decode_address(address_bytes)
 
 
 def parse_type(type_: dict[str, Any]) -> Union[str, tuple, list]:
