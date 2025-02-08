@@ -1,14 +1,19 @@
+from abc import abstractmethod
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 from eth_pydantic_types import HexBytes
 
 from ape.exceptions import ConversionError
-from ape.types import AddressType, ContractCode, CurrencyValue
-from ape.utils import BaseInterface, abstractmethod, cached_property, log_instead_of_fail
+from ape.types.address import AddressType
+from ape.types.units import CurrencyValue
+from ape.utils.basemodel import BaseInterface
+from ape.utils.misc import log_instead_of_fail
 
 if TYPE_CHECKING:
     from ape.api.transactions import ReceiptAPI, TransactionAPI
     from ape.managers.chain import AccountHistory
+    from ape.types.vm import ContractCode
 
 
 class BaseAddress(BaseInterface):
@@ -141,13 +146,12 @@ class BaseAddress(BaseInterface):
             super().__setattr__(attr, value)
 
     @property
-    def code(self) -> ContractCode:
+    def code(self) -> "ContractCode":
         """
         The raw bytes of the smart-contract code at the address.
         """
-
-        # TODO: Explore caching this (based on `self.provider.network` and examining code)
-        return self.provider.get_code(self.address)
+        # NOTE: Chain manager handles code caching.
+        return self.chain_manager.get_code(self.address)
 
     @property
     def codesize(self) -> int:

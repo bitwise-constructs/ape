@@ -1,6 +1,7 @@
 import os
+import re
 from pathlib import Path
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import pytest
 from pydantic import ValidationError
@@ -9,11 +10,102 @@ from pydantic_settings import SettingsConfigDict
 from ape.api.config import ApeConfig, ConfigEnum, PluginConfig
 from ape.exceptions import ConfigError
 from ape.managers.config import CONFIG_FILE_NAME, merge_configs
-from ape.types import GasLimit
-from ape.utils import create_tempdir
-from ape_ethereum.ecosystem import EthereumConfig, NetworkConfig
-from ape_networks import CustomNetwork
+from ape.utils.os import create_tempdir
+from ape_cache.config import CacheConfig
+from ape_compile.config import Config as CompileConfig
+from ape_ethereum.ecosystem import EthereumConfig, ForkedNetworkConfig, NetworkConfig
+from ape_networks.config import CustomNetwork
+from ape_node.provider import EthereumNetworkConfig, EthereumNodeConfig
+from ape_test.config import CoverageReportsConfig, GasConfig, GasExclusion
 from tests.functional.conftest import PROJECT_WITH_LONG_CONTRACTS_FOLDER
+
+if TYPE_CHECKING:
+    from ape.types.gas import GasLimit
+
+
+CONTRACTS_FOLDER = "pathsomewhwere"
+NUMBER_OF_TEST_ACCOUNTS = 31
+YAML_CONTENT = rf"""
+contracts_folder: "{CONTRACTS_FOLDER}"
+
+dependencies:
+  - name: "openzeppelin"
+    github: "OpenZeppelin/openzeppelin-contracts"
+    version: "4.5.0"
+
+plugins:
+  - name: "hardhat"
+  - name: "solidity"
+    version: "0.8.1"
+
+test:
+  number_of_accounts: "{NUMBER_OF_TEST_ACCOUNTS}"
+
+compile:
+  exclude:
+    - "exclude_dir"
+    - "Excl*.json"
+    - r"Ignore\w*\.json"
+""".lstrip()
+JSON_CONTENT = f"""
+{{
+    "contracts_folder": "{CONTRACTS_FOLDER}",
+    "dependencies": [
+        {{
+            "name": "openzeppelin",
+            "github": "OpenZeppelin/openzeppelin-contracts",
+            "version": "4.5.0"
+        }}
+    ],
+    "plugins": [
+        {{
+            "name": "hardhat"
+        }},
+        {{
+            "name": "solidity",
+            "version": "0.8.1"
+        }}
+    ],
+    "test": {{
+        "number_of_accounts": "{NUMBER_OF_TEST_ACCOUNTS}"
+    }},
+    "compile": {{
+        "exclude": [
+            "exclude_dir",
+            "Excl*.json",
+            "r\\"Ignore\\\\w*\\\\.json\\""
+        ]
+    }}
+}}
+""".lstrip()
+PYPROJECT_TOML = rf"""
+[tool.ape]
+contracts_folder = "{CONTRACTS_FOLDER}"
+
+[[tool.ape.dependencies]]
+name = "openzeppelin"
+github = "OpenZeppelin/openzeppelin-contracts"
+version = "4.5.0"
+
+[[tool.ape.plugins]]
+name = "hardhat"
+
+[[tool.ape.plugins]]
+name = "solidity"
+version = "0.8.1"
+
+[tool.ape.test]
+number_of_accounts = {NUMBER_OF_TEST_ACCOUNTS}
+
+[tool.ape.compile]
+exclude = ["exclude_dir", "Excl*.json", 'r"Ignore\w*\.json"']
+""".lstrip()
+EXT_TO_CONTENT = {
+    ".yml": YAML_CONTENT,
+    ".yaml": YAML_CONTENT,
+    ".json": JSON_CONTENT,
+    ".toml": PYPROJECT_TOML,
+}
 
 
 def test_model_validate_empty():
@@ -41,17 +133,97 @@ def test_model_validate_path_contracts_folder():
     assert cfg.contracts_folder == str(path)
 
 
-def test_validate_file():
-    value = "pathtowherever"
+def test_model_validate_handles_environment_variables():
+    def run_test(cls: Callable, attr: str, name: str, value: str, expected: Any = None):
+        expected = expected if expected is not None else value
+        before: str | None = os.environ.get(name)
+        os.environ[name] = value
+        try:
+            instance = cls()
+            assert getattr(instance, attr) == expected
+        finally:
+            if before is not None:
+                os.environ[name] = before
+            else:
+                os.environ.pop(name, None)
+
+    # Test different config classes.
+    run_test(ApeConfig, "contracts_folder", "APE_CONTRACTS_FOLDER", "3465220869b2")
+    run_test(CacheConfig, "size", "APE_CACHE_SIZE", "8627", 8627)
+    run_test(
+        CompileConfig, "include_dependencies", "APE_COMPILE_INCLUDE_DEPENDENCIES", "true", True
+    )
+    run_test(
+        ForkedNetworkConfig, "upstream_provider", "APE_ETHEREUM_UPSTREAM_PROVIDER", "411236f13659"
+    )
+    run_test(
+        NetworkConfig, "required_confirmations", "APE_ETHEREUM_REQUIRED_CONFIRMATIONS", "6498", 6498
+    )
+    run_test(EthereumNetworkConfig, "mainnet", "APE_NODE_MAINNET", '{"a":"b"}', {"a": "b"})
+    run_test(EthereumNodeConfig, "executable", "APE_NODE_EXECUTABLE", "40613177e494")
+    run_test(CoverageReportsConfig, "terminal", "APE_TEST_TERMINAL", "false", False)
+    run_test(GasConfig, "reports", "APE_TEST_REPORTS", '["terminal"]', ["terminal"])
+    run_test(GasExclusion, "method_name", "APE_TEST_METHOD_NAME", "32aa54e3c5d2")
+
+    # Assert that union types are handled.
+    run_test(NetworkConfig, "gas_limit", "APE_ETHEREUM_GAS_LIMIT", "0", 0)
+    run_test(NetworkConfig, "gas_limit", "APE_ETHEREUM_GAS_LIMIT", "0x100", 0x100)
+    run_test(NetworkConfig, "gas_limit", "APE_ETHEREUM_GAS_LIMIT", "auto")
+    run_test(NetworkConfig, "gas_limit", "APE_ETHEREUM_GAS_LIMIT", "max")
+    with pytest.raises(ValidationError, match=r"Value error, Invalid gas limit"):
+        run_test(NetworkConfig, "gas_limit", "APE_ETHEREUM_GAS_LIMIT", "something")
+
+    # Assert that various bool variants are parsed correctly.
+    for bool_val in ("0", "False", "fALSE", "FALSE"):
+        run_test(NetworkConfig, "is_mainnet", "APE_ETHEREUM_IS_MAINNET", bool_val, False)
+
+    for bool_val in ("1", "True", "tRUE", "TRUE"):
+        run_test(NetworkConfig, "is_mainnet", "APE_ETHEREUM_IS_MAINNET", bool_val, True)
+
+    # We expect a failure when there's a type mismatch.
+    with pytest.raises(
+        ValidationError,
+        match=r"Input should be a valid boolean, unable to interpret input",
+    ):
+        run_test(NetworkConfig, "is_mainnet", "APE_ETHEREUM_IS_MAINNET", "not a boolean", False)
+
+    with pytest.raises(
+        ValidationError,
+        match=r"Input should be a valid integer, unable to parse string as an integer",
+    ):
+        run_test(
+            NetworkConfig,
+            "required_confirmations",
+            "APE_ETHEREUM_REQUIRED_CONFIRMATIONS",
+            "not a number",
+            42,
+        )
+
+
+@pytest.mark.parametrize(
+    "file", ("ape-config.yml", "ape-config.yaml", "ape-config.json", "pyproject.toml")
+)
+def test_validate_file(file):
+    content = EXT_TO_CONTENT[Path(file).suffix]
     with create_tempdir() as temp_dir:
-        file = temp_dir / "ape-config.yaml"
-        file.write_text(f"contracts_folder: {value}")
-        actual = ApeConfig.validate_file(file)
+        path = temp_dir / file
+        path.write_text(content)
+        actual = ApeConfig.validate_file(path)
 
-    assert actual.contracts_folder == value
+    assert actual.contracts_folder == CONTRACTS_FOLDER
+    assert actual.test.number_of_accounts == NUMBER_OF_TEST_ACCOUNTS
+    assert len(actual.dependencies) == 1
+    assert actual.dependencies[0]["name"] == "openzeppelin"
+    assert actual.dependencies[0]["github"] == "OpenZeppelin/openzeppelin-contracts"
+    assert actual.dependencies[0]["version"] == "4.5.0"
+    assert actual.plugins == [{"name": "hardhat"}, {"name": "solidity", "version": "0.8.1"}]
+    assert re.compile("Ignore\\w*\\.json") in actual.compile.exclude
+    assert "exclude_dir" in actual.compile.exclude
+    assert ".cache" in actual.compile.exclude
+    assert "Excl*.json" in actual.compile.exclude
 
 
-def test_validate_file_expands_env_vars():
+def test_validate_file_expands_environment_variables():
     secret = "mycontractssecretfolder"
     env_var_name = "APE_TEST_CONFIG_SECRET_CONTRACTS_FOLDER"
     os.environ[env_var_name] = secret
@@ -93,6 +265,16 @@ def test_validate_file_shows_linenos_handles_lists():
         assert str(file) in str(err.value)
         assert "sepolia:" in str(err.value)
         assert "-->4" in str(err.value)
+
+
+def test_validate_file_uses_project_name():
+    name = "apexampledapp"
+    with create_tempdir() as temp_dir:
+        file = temp_dir / "pyproject.toml"
+        content = f'[project]\nname = "{name}"\n'
+        file.write_text(content)
+        cfg = ApeConfig.validate_file(file)
+        assert cfg.name == name
 
 
 def test_deployments(networks_connected_to_tester, owner, vyper_contract_container, project):
@@ -179,7 +361,7 @@ def test_network_gas_limit_default(config):
     assert eth_config.local.gas_limit == "max"
 
 
-def _sepolia_with_gas_limit(gas_limit: GasLimit) -> dict:
+def _sepolia_with_gas_limit(gas_limit: "GasLimit") -> dict:
     return {
         "ethereum": {
             "sepolia": {

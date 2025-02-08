@@ -18,10 +18,9 @@ from ape.exceptions import (
     ProjectError,
     SignatureError,
 )
-from ape.types import AutoGasLimit
+from ape.types.gas import AutoGasLimit
 from ape.types.signatures import recover_signer
-from ape.utils.testing import DEFAULT_NUMBER_OF_TEST_ACCOUNTS
-from ape_accounts import (
+from ape_accounts.accounts import (
     KeyfileAccount,
     generate_account,
     import_account_from_mnemonic,
@@ -171,7 +170,7 @@ def test_transfer_without_value_send_everything_true_with_low_gas(sender, receiv
 
     # Clear balance of sender.
     # Use small gas so for sure runs out of money.
-    receipt = sender.transfer(receiver, send_everything=True, gas=21000)
+    receipt = sender.transfer(receiver, send_everything=True, gas=22000)
 
     value_given = receipt.value
     total_spent = value_given + receipt.total_fees_paid
@@ -241,7 +240,33 @@ def test_transfer_value_of_0(sender, receiver):
     assert receiver.balance == initial_balance
 
 
-def test_deploy(owner, contract_container, chain, clean_contracts_cache):
+def test_transfer_mixed_up_sender_and_value(sender, receiver):
+    """
+    Testing the case where the user mixes up the argument order,
+    it should show a nicer error than it was previously, as this is
+    a common and easy mistake.
+    """
+    expected = (
+        r"Cannot use integer-type for the `receiver` "
+        r"argument in the `\.transfer\(\)` method \(this "
+        r"protects against accidentally passing the "
+        r"`value` as the `receiver`\)."
+    )
+    with pytest.raises(AccountsError, match=expected):
+        sender.transfer(123, receiver)
+
+    # Similarly show using currency-str (may fail for different error).
+    expected = r"Invalid `receiver` value: '123 wei'\."
+    with pytest.raises(AccountsError, match=expected):
+        sender.transfer("123 wei", receiver)
+
+
+def test_transfer_sign_is_false(sender, receiver):
+    with pytest.raises(SignatureError):
+        sender.transfer(receiver, "1 gwei", sign=False)
+
+
+def test_deploy(owner, contract_container, clean_contract_caches):
     contract = owner.deploy(contract_container, 0)
     assert contract.address
     assert contract.txn_hash
@@ -275,6 +300,7 @@ def test_deploy_and_publish(owner, contract_container, dummy_live_network, mock_
     dummy_live_network.__dict__["explorer"] = mock_explorer
     contract = owner.deploy(contract_container, 0, publish=True, required_confirmations=0)
     mock_explorer.publish_contract.assert_called_once_with(contract.address)
+    dummy_live_network.__dict__["explorer"] = None
 
 
 @explorer_test
@@ -282,21 +308,36 @@ def test_deploy_and_not_publish(owner, contract_container, dummy_live_network, m
     dummy_live_network.__dict__["explorer"] = mock_explorer
     owner.deploy(contract_container, 0, publish=True, required_confirmations=0)
     assert not mock_explorer.call_count
+    dummy_live_network.__dict__["explorer"] = None
 
 
 def test_deploy_proxy(owner, vyper_contract_instance, proxy_contract_container, chain):
     target = vyper_contract_instance.address
     proxy = owner.deploy(proxy_contract_container, target)
-    assert proxy.address in chain.contracts._local_contract_types
-    assert proxy.address in chain.contracts._local_proxies
 
-    actual = chain.contracts._local_proxies[proxy.address]
-    assert actual.target == target
-    assert actual.type == ProxyType.Delegate
+    # Ensure we can call both proxy and target methods on it.
+    assert proxy.implementation  # No attr err
+    assert proxy.myNumber  # No attr err
+
+    # Ensure was properly cached.
+    assert proxy.address in chain.contracts.contract_types
+    assert proxy.address in chain.contracts.proxy_infos
+
+    # Show the cached proxy info is correct.
+    proxy_info = chain.contracts.proxy_infos[proxy.address]
+    assert proxy_info.target == target
+    assert proxy_info.type == ProxyType.Delegate
+    assert proxy_info.abi.name == "implementation"
 
     # Show we get the implementation contract type using the proxy address
-    implementation = chain.contracts.instance_at(proxy.address)
-    assert implementation.contract_type == vyper_contract_instance.contract_type
+    re_contract = chain.contracts.instance_at(proxy.address)
+    assert re_contract.contract_type == proxy.contract_type
+
+    # Show proxy methods are not available on target alone.
+    target = chain.contracts.instance_at(proxy_info.target)
+    assert target.myNumber  # No attr err
+    with pytest.raises(AttributeError):
+        _ = target.implementation
 
 
 def test_deploy_instance(owner, vyper_contract_instance):
@@ -332,7 +373,7 @@ def test_deploy_no_deployment_bytecode(owner, bytecode):
         owner.deploy(contract)
 
 
-def test_deploy_contract_type(owner, vyper_contract_type, chain, clean_contracts_cache):
+def test_deploy_contract_type(owner, vyper_contract_type, clean_contract_caches):
     contract = owner.deploy(vyper_contract_type, 0)
     assert contract.address
     assert contract.txn_hash
@@ -362,7 +403,7 @@ def test_send_transaction_without_enough_funds_impersonated_account(
 ):
     address = "0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97"  # Not a test account!
     impersonated_account = ImpersonatedAccount(raw_address=address)
-    accounts.test_accounts._impersonated_accounts[address] = impersonated_account
+    accounts._impersonated_accounts[address] = impersonated_account
 
     # Basically, it failed anywhere else besides the AccountsError you get from not
     # enough balance.
@@ -376,23 +417,28 @@ def test_send_transaction_sets_defaults(sender, receiver):
     assert receipt.required_confirmations == 0
 
 
-def test_accounts_splice_access(test_accounts):
-    a, b = test_accounts[:2]
-    assert a == test_accounts[0]
-    assert b == test_accounts[1]
-    c = test_accounts[-1]
-    assert c == test_accounts[len(test_accounts) - 1]
-    expected = (
-        (len(test_accounts) // 2) if len(test_accounts) % 2 == 0 else (len(test_accounts) // 2 + 1)
-    )
-    assert len(test_accounts[::2]) == expected
+def test_account_index_access(accounts):
+    account = accounts[0]
+    assert account.index == 0
+    last_account = accounts[-1]
+    assert last_account.index == len(accounts) - 1
+
+
+def test_accounts_splice_access(accounts):
+    alice, bob = accounts[:2]
+    assert alice == accounts[0]
+    assert bob == accounts[1]
+    cat = accounts[-1]
+    assert cat == accounts[len(accounts) - 1]
+    expected = (len(accounts) // 2) if len(accounts) % 2 == 0 else (len(accounts) // 2 + 1)
+    assert len(accounts[::2]) == expected
 
 
 def test_accounts_address_access(owner, accounts):
     assert accounts[owner.address] == owner
 
 
-def test_accounts_address_access_conversion_fail(accounts):
+def test_accounts_address_access_conversion_fail(account_manager):
     with pytest.raises(
         KeyError,
         match=(
@@ -400,7 +446,7 @@ def test_accounts_address_access_conversion_fail(accounts):
             r"Do you have the necessary conversion plugins installed?"
         ),
     ):
-        _ = accounts["FAILS"]
+        _ = account_manager["FAILS"]
 
 
 def test_accounts_address_access_not_found(accounts):
@@ -409,15 +455,15 @@ def test_accounts_address_access_not_found(accounts):
         _ = accounts[address]
 
 
-def test_test_accounts_address_access_conversion_fail(test_accounts):
+def test_test_accounts_address_access_conversion_fail(accounts):
     with pytest.raises(KeyError, match=r"No account with ID 'FAILS'"):
-        _ = test_accounts["FAILS"]
+        _ = accounts["FAILS"]
 
 
-def test_test_accounts_address_access_not_found(test_accounts):
+def test_test_accounts_address_access_not_found(accounts):
     address = "0x1222262222222922222222222222222222222222"
     with pytest.raises(KeyError, match=rf"No account with address '{address}'\."):
-        _ = test_accounts[address]
+        _ = accounts[address]
 
 
 def test_accounts_contains(accounts, owner):
@@ -459,9 +505,9 @@ def test_impersonated_account_ignores_signature_check_on_txn(accounts, address):
     account = ImpersonatedAccount(raw_address=address)
 
     # Impersonate hack, since no providers in core actually support it.
-    accounts.test_accounts._impersonated_accounts[address] = account
-    other_0 = accounts.test_accounts[8]
-    other_1 = accounts.test_accounts[9]
+    accounts._impersonated_accounts[address] = account
+    other_0 = accounts[8]
+    other_1 = accounts[9]
     txn = other_0.transfer(other_1, "1 gwei").transaction
 
     # Hack in fake sender.
@@ -553,13 +599,13 @@ def test_unlock_with_wrong_passphrase_from_env(keyfile_account):
     assert keyfile_account.locked
 
 
-def test_unlock_and_reload(runner, accounts, keyfile_account, message):
+def test_unlock_and_reload(runner, account_manager, keyfile_account, message):
     """
     Tests against a condition where reloading after unlocking
     would not honor unlocked state.
     """
     keyfile_account.unlock(passphrase=PASSPHRASE)
-    reloaded_account = accounts.load(keyfile_account.alias)
+    reloaded_account = account_manager.load(keyfile_account.alias)
 
     # y: yes, sign (note: unlocking makes the key available but is not the same as autosign).
     with runner.isolation(input="y\n"):
@@ -567,23 +613,20 @@ def test_unlock_and_reload(runner, accounts, keyfile_account, message):
         assert keyfile_account.check_signature(message, signature)
 
 
-def test_custom_num_of_test_accounts_config(test_accounts, project):
-    custom_number_of_test_accounts = 20
+def test_custom_num_of_test_accounts_config(accounts, project):
+    custom_number_of_test_accounts = 25
     test_config = {
         "test": {
             "number_of_accounts": custom_number_of_test_accounts,
         }
     }
-
-    assert len(test_accounts) == DEFAULT_NUMBER_OF_TEST_ACCOUNTS
-
     with project.temp_config(**test_config):
-        assert len(test_accounts) == custom_number_of_test_accounts
+        assert len(accounts) == custom_number_of_test_accounts
 
 
-def test_test_accounts_repr(test_accounts):
-    actual = repr(test_accounts)
-    assert all(a.address in actual for a in test_accounts)
+def test_test_accounts_repr(accounts, config):
+    actual = repr(accounts)
+    assert config.get_config("test").hd_path in actual
 
 
 def test_account_comparison_to_non_account(core_account):
@@ -591,17 +634,26 @@ def test_account_comparison_to_non_account(core_account):
     assert core_account != "foo"
 
 
-def test_create_account(test_accounts):
-    length_at_start = len(test_accounts)
-    created_account = test_accounts.generate_test_account()
+def test_create_account(accounts):
+    length_at_start = len(accounts)
+    created_account = accounts.generate_test_account()
 
     assert isinstance(created_account, TestAccount)
     assert created_account.index == length_at_start
 
-    second_created_account = test_accounts.generate_test_account()
+    length_at_start = len(accounts)
+    second_created_account = accounts.generate_test_account()
+    assert len(accounts) == length_at_start + 1
 
     assert created_account.address != second_created_account.address
     assert second_created_account.index == created_account.index + 1
+
+    # Last index should now refer to the last-created account.
+    last_idx_acct = accounts[-1]
+    assert last_idx_acct.index == second_created_account.index
+    assert last_idx_acct.address == second_created_account.address
+    assert last_idx_acct.address != accounts[0].address
+    assert last_idx_acct.address != created_account.address
 
 
 def test_dir(core_account):
@@ -627,42 +679,42 @@ def test_is_not_contract(owner, keyfile_account):
     assert not keyfile_account.is_contract
 
 
-def test_using_different_hd_path(test_accounts, project, eth_tester_provider):
+def test_using_different_hd_path(accounts, project, eth_tester_provider):
     test_config = {
         "test": {
             "hd_path": "m/44'/60'/0/0",
         }
     }
 
-    old_address = test_accounts[0].address
+    old_address = accounts[0].address
     original_settings = eth_tester_provider.settings.model_dump(by_alias=True)
     with project.temp_config(**test_config):
         eth_tester_provider.update_settings(test_config["test"])
-        new_address = test_accounts[0].address
+        new_address = accounts[0].address
 
     eth_tester_provider.update_settings(original_settings)
     assert old_address != new_address
 
 
-def test_using_random_mnemonic(test_accounts, project, eth_tester_provider):
+def test_using_random_mnemonic(accounts, project, eth_tester_provider):
     mnemonic = "candy maple cake sugar pudding cream honey rich smooth crumble sweet treat"
     test_config = {"test": {"mnemonic": mnemonic}}
 
-    old_address = test_accounts[0].address
+    old_address = accounts[0].address
     original_settings = eth_tester_provider.settings.model_dump(by_alias=True)
     with project.temp_config(**test_config):
         eth_tester_provider.update_settings(test_config["test"])
-        new_address = test_accounts[0].address
+        new_address = accounts[0].address
 
     eth_tester_provider.update_settings(original_settings)
     assert old_address != new_address
 
 
-def test_iter_test_accounts(test_accounts):
-    test_accounts.reset()
-    accounts = list(iter(test_accounts))
+def test_iter_test_accounts(accounts):
+    accounts.reset()
+    accounts = list(iter(accounts))
     actual = len(accounts)
-    expected = len(test_accounts)
+    expected = len(accounts)
     assert actual == expected
 
 
@@ -908,6 +960,38 @@ def test_import_account_from_private_key_insecure_passphrase(delete_account_afte
             import_account_from_private_key(simple_alias, "simple", PRIVATE_KEY)
 
 
-def test_load(accounts, keyfile_account):
-    account = accounts.load(keyfile_account.alias)
+def test_load(account_manager, keyfile_account):
+    account = account_manager.load(keyfile_account.alias)
     assert account == keyfile_account
+
+
+def test_get_deployment_address(owner, vyper_contract_container):
+    deployment_address_1 = owner.get_deployment_address()
+    deployment_address_2 = owner.get_deployment_address(nonce=owner.nonce + 1)
+    instance_1 = owner.deploy(vyper_contract_container, 490)
+    assert instance_1.address == deployment_address_1
+    instance_2 = owner.deploy(vyper_contract_container, 490)
+    assert instance_2.address == deployment_address_2
+
+
+def test_repr(account_manager):
+    """
+    NOTE: __repr__ should be simple and fast!
+      Previously, we showed the repr of all the accounts.
+      That was a bad idea, as that can be very unnecessarily slow.
+      Hence, this test exists to ensure care is taken.
+    """
+    actual = repr(account_manager)
+    assert actual == "<AccountManager>"
+
+
+def test_call(owner, vyper_contract_instance):
+    tx = vyper_contract_instance.setNumber.as_transaction(5991)
+    receipt = owner.call(tx)
+    assert not receipt.failed
+
+
+def test_call_sign_false(owner, vyper_contract_instance):
+    tx = vyper_contract_instance.setNumber.as_transaction(5991)
+    with pytest.raises(SignatureError):
+        owner.call(tx, sign=False)

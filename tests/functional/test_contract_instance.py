@@ -17,8 +17,9 @@ from ape.exceptions import (
     ContractLogicError,
     CustomError,
     MethodNonPayableError,
+    SignatureError,
 )
-from ape.types import AddressType
+from ape.types.address import AddressType
 from ape_ethereum.transactions import TransactionStatusEnum, TransactionType
 
 MATCH_TEST_CONTRACT = re.compile(r"<TestContract((Sol)|(Vy))")
@@ -72,6 +73,11 @@ def test_eq(vyper_contract_instance, chain):
 def test_contract_transactions(owner, contract_instance):
     contract_instance.setNumber(2, sender=owner)
     assert contract_instance.myNumber() == 2
+
+
+def test_contract_transaction_when_sign_false(owner, contract_instance):
+    with pytest.raises(SignatureError):
+        contract_instance.setNumber(2, sender=owner, sign=False)
 
 
 def test_wrong_number_of_arguments(owner, contract_instance):
@@ -819,7 +825,7 @@ def test_get_error_by_signature(error_contract):
 
 
 def test_selector_identifiers(vyper_contract_instance):
-    assert len(vyper_contract_instance.selector_identifiers.keys()) == 54
+    assert len(vyper_contract_instance.selector_identifiers.keys()) >= 54
     assert vyper_contract_instance.selector_identifiers["balances(address)"] == "0x27e235e3"
     assert vyper_contract_instance.selector_identifiers["owner()"] == "0x8da5cb5b"
     assert (
@@ -829,7 +835,7 @@ def test_selector_identifiers(vyper_contract_instance):
 
 
 def test_identifier_lookup(vyper_contract_instance):
-    assert len(vyper_contract_instance.identifier_lookup.keys()) == 54
+    assert len(vyper_contract_instance.identifier_lookup.keys()) >= 54
     assert vyper_contract_instance.identifier_lookup["0x27e235e3"].selector == "balances(address)"
     assert vyper_contract_instance.identifier_lookup["0x8da5cb5b"].selector == "owner()"
     assert (

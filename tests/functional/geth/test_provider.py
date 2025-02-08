@@ -1,21 +1,23 @@
+import re
+from abc import ABC
 from pathlib import Path
-from typing import cast
+from typing import Optional, cast
 
 import pytest
 from eth_pydantic_types import HexBytes32
 from eth_typing import HexStr
 from eth_utils import keccak, to_hex
-from evmchains import PUBLIC_CHAIN_META
 from hexbytes import HexBytes
 from web3 import AutoProvider, Web3
 from web3.exceptions import ContractLogicError as Web3ContractLogicError
 from web3.exceptions import ExtraDataLengthError
-from web3.middleware import ExtraDataToPOAMiddleware
 from web3.providers import HTTPProvider
 
+from ape.api import NetworkAPI
 from ape.exceptions import (
     APINotImplementedError,
     BlockNotFoundError,
+    ConfigError,
     ContractLogicError,
     NetworkMismatchError,
     ProviderError,
@@ -24,8 +26,10 @@ from ape.exceptions import (
     VirtualMachineError,
 )
 from ape.utils import to_int
+from ape.utils._web3_compat import ExtraDataToPOAMiddleware
+from ape.utils.os import create_tempdir
 from ape_ethereum.ecosystem import Block
-from ape_ethereum.provider import DEFAULT_SETTINGS, EthereumNodeProvider
+from ape_ethereum.provider import DEFAULT_SETTINGS, EthereumNodeProvider, Web3Provider
 from ape_ethereum.trace import TraceApproach
 from ape_ethereum.transactions import (
     AccessList,
@@ -41,6 +45,11 @@ from tests.conftest import GETH_URI, geth_process_test
 @pytest.fixture
 def web3_factory(mocker):
     return mocker.patch("ape_ethereum.provider._create_web3")
+
+
+@pytest.fixture
+def process_factory_patch(mocker):
+    return mocker.patch("ape_node.provider.GethDevProcess.from_uri")
 
 
 @pytest.fixture
@@ -63,14 +72,6 @@ def test_uri(geth_provider):
     assert geth_provider.http_uri == GETH_URI
     assert not geth_provider.ws_uri
     assert geth_provider.uri == GETH_URI
-
-
-@geth_process_test
-def test_uri_localhost_not_running_uses_random_default(config):
-    cfg = config.get_config("node").ethereum.mainnet
-    assert cfg["uri"] in PUBLIC_CHAIN_META["ethereum"]["mainnet"]["rpc"]
-    cfg = config.get_config("node").ethereum.sepolia
-    assert cfg["uri"] in PUBLIC_CHAIN_META["ethereum"]["sepolia"]["rpc"]
 
 
 @geth_process_test
@@ -125,6 +126,47 @@ def test_uri_non_dev_and_not_configured(mocker, ethereum):
 
     actual = provider.uri
     assert actual == expected
+
+
+@geth_process_test
+def test_uri_invalid(geth_provider, project, ethereum):
+    settings = geth_provider.provider_settings
+    geth_provider.provider_settings = {}
+    value = "I AM NOT A URI OF ANY KIND!"
+    config = {"node": {"ethereum": {"local": {"uri": value}}}}
+
+    try:
+        with project.temp_config(**config):
+            # Assert we use the config value.
+            expected = rf"Invalid uri: {re.escape(value)}"
+            with pytest.raises(ConfigError, match=expected):
+                _ = geth_provider.uri
+
+    finally:
+        geth_provider.provider_settings = settings
+
+
+def test_uri_missing(mock_sepolia):
+    class MyProvider(Web3Provider, ABC):
+        network: NetworkAPI = mock_sepolia
+        name: str = "devnode"
+        _connected_uri = None
+        _configured_rpc = None
+
+        @property
+        def _default_http_uri(self) -> Optional[str]:
+            # Doing this to get the error to occur.
+            return None
+
+        def connect(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+    provider = MyProvider()
+    with pytest.raises(ProviderError, match="Missing URI for network 'sepolia' on 'ethereum'."):
+        _ = provider.uri
 
 
 @geth_process_test
@@ -224,7 +266,14 @@ def test_connect_to_chain_that_started_poa(mock_web3, web3_factory, ethereum):
     to fetch blocks during the PoA portion of the chain.
     """
     mock_web3.eth.get_block.side_effect = ExtraDataLengthError
-    mock_web3.eth.chain_id = ethereum.sepolia.chain_id
+
+    def make_request(rpc, arguments):
+        if rpc == "eth_chainId":
+            return {"result": ethereum.sepolia.chain_id}
+
+        return None
+
+    mock_web3.provider.make_request.side_effect = make_request
     web3_factory.return_value = mock_web3
     provider = ethereum.sepolia.get_provider("node")
     provider.provider_settings = {"uri": "http://node.example.com"}  # fake
@@ -236,7 +285,18 @@ def test_connect_to_chain_that_started_poa(mock_web3, web3_factory, ethereum):
 
 
 @geth_process_test
-def test_connect_using_only_ipc_for_uri(project, networks, geth_provider):
+def test_connect_using_only_ipc_for_uri_already_connected(project, networks, geth_provider):
+    """
+    Shows we can remote-connect to a node that is already running when it exposes its IPC path.
+    """
+    ipc_path = geth_provider.ipc_path
+    with project.temp_config(node={"ethereum": {"local": {"uri": f"{ipc_path}"}}}):
+        with networks.ethereum.local.use_provider("node") as node:
+            assert node.uri == f"{ipc_path}"
+
+
+@geth_process_test
+def test_connect_using_ipc(process_factory_patch, project, networks, geth_provider):
     ipc_path = geth_provider.ipc_path
     with project.temp_config(node={"ethereum": {"local": {"uri": f"{ipc_path}"}}}):
         with networks.ethereum.local.use_provider("node") as node:
@@ -502,6 +562,22 @@ def test_send_transaction_when_no_error_and_receipt_fails(
 
 
 @geth_process_test
+def test_send_transaction_exceed_block_gas_limit(chain, geth_provider, geth_contract, geth_account):
+    """
+    Shows that the local geth node will retry the transaction
+    with a new gas if this happens, automatically.
+    """
+    transaction = geth_contract.setNumber.as_transaction(23333322101, sender=geth_account)
+    prepared = geth_account.prepare_transaction(transaction)
+    prepared.gas_limit += 100000
+    signed = geth_account.sign_transaction(prepared)
+    expected_gas_limit = chain.blocks.head.gas_limit
+    geth_provider.send_transaction(signed)
+    tx_sent = geth_account.history[-1]
+    assert tx_sent.gas_limit == expected_gas_limit
+
+
+@geth_process_test
 def test_send_call(geth_provider, ethereum, tx_for_call):
     actual = geth_provider.send_call(tx_for_call)
     assert to_int(actual) == 0
@@ -580,7 +656,7 @@ def test_send_call_skip_trace(mocker, geth_provider, ethereum, tx_for_call):
 @geth_process_test
 def test_network_choice(geth_provider):
     actual = geth_provider.network_choice
-    expected = "ethereum:local:node"
+    expected = "ethereum:local:http://127.0.0.1:5550"
     assert actual == expected
 
 
@@ -638,7 +714,7 @@ def test_make_request_not_exists_different_messages(message, mock_web3, geth_pro
 def test_geth_bin_not_found():
     bin_name = "__NOT_A_REAL_EXECUTABLE_HOPEFULLY__"
     with pytest.raises(NodeSoftwareNotInstalledError):
-        _ = GethDevProcess(Path.cwd(), executable=bin_name)
+        _ = GethDevProcess(Path.cwd() / "notexists", executable=bin_name)
 
 
 @geth_process_test
@@ -707,8 +783,17 @@ def test_estimate_gas_cost_of_static_fee_txn(geth_contract, geth_provider, geth_
 
 
 @geth_process_test
-def test_estimate_gas_cost_reverts(geth_contract, geth_provider, geth_second_account):
+def test_estimate_gas_cost_reverts_with_message(geth_contract, geth_provider, geth_second_account):
+    # NOTE: The error message from not-owner is "!authorized".
     txn = geth_contract.setNumber.as_transaction(900, sender=geth_second_account, type=0)
+    with pytest.raises(ContractLogicError):
+        geth_provider.estimate_gas_cost(txn)
+
+
+@geth_process_test
+def test_estimate_gas_cost_reverts_no_message(geth_contract, geth_provider, geth_account):
+    # NOTE: The error message from using `5` has no revert message.
+    txn = geth_contract.setNumber.as_transaction(5, sender=geth_account, type=0)
     with pytest.raises(ContractLogicError):
         geth_provider.estimate_gas_cost(txn)
 
@@ -766,9 +851,8 @@ def test_trace_approach_config(project):
 
 
 @geth_process_test
-def test_start(mocker, convert, project, geth_provider):
+def test_start(process_factory_patch, convert, project, geth_provider):
     amount = convert("100_000 ETH", int)
-    spy = mocker.spy(GethDevProcess, "from_uri")
 
     with project.temp_config(test={"balance": amount}):
         try:
@@ -776,10 +860,113 @@ def test_start(mocker, convert, project, geth_provider):
         except Exception:
             pass  # Exceptions are fine here.
 
-        actual = spy.call_args[1]["balance"]
-        assert actual == amount
+    actual = process_factory_patch.call_args[1]["balance"]
+    assert actual == amount
 
 
 @geth_process_test
-def test_auto_mine(geth_provider):
+@pytest.mark.parametrize("key", ("uri", "ws_uri"))
+def test_start_from_ws_uri(process_factory_patch, project, geth_provider, key):
+    uri = "ws://localhost:5677"
+
+    settings = geth_provider.provider_settings
+    with project.temp_config(node={"ethereum": {"local": {key: uri}}}):
+        geth_provider.provider_settings = {}
+        try:
+            geth_provider.start()
+        except Exception:
+            pass  # Exceptions are fine here.
+
+        geth_provider.provider_settings = settings
+
+    actual = process_factory_patch.call_args[0][0]  # First "arg"
+    assert actual == uri
+
+
+@geth_process_test
+def test_auto_mine(geth_provider, geth_account, geth_contract):
     assert geth_provider.auto_mine is True
+
+    class MyEthereumTestProvider(EthereumNodeProvider):
+        """
+        Simulates a provider like ape-foundry w/ auto-mine disabled.
+        """
+
+        @property
+        def auto_mine(self) -> bool:
+            return False
+
+    provider = MyEthereumTestProvider(network=geth_provider.network)
+    provider._web3 = geth_provider.web3  # Borrow connection.
+
+    tx = geth_contract.setNumber.as_transaction(123)
+    tx = geth_account.prepare_transaction(tx)
+    tx = geth_account.sign_transaction(tx)
+    receipt = provider.send_transaction(tx)
+    assert not receipt.confirmed
+
+
+@geth_process_test
+def test_geth_dev_from_uri_http(data_folder):
+    geth_dev = GethDevProcess.from_uri("http://localhost:6799", data_folder)
+    kwargs = geth_dev.geth_kwargs
+    assert kwargs["rpc_addr"] == "localhost"
+    assert kwargs["rpc_port"] == "6799"
+    assert kwargs["ws_enabled"] is False
+    assert kwargs.get("ws_api") is None
+    assert kwargs.get("ws_addr") is None
+    assert kwargs.get("ws_port") is None
+
+
+@geth_process_test
+def test_geth_dev_from_uri_ws(data_folder):
+    geth_dev = GethDevProcess.from_uri("ws://localhost:6799", data_folder)
+    kwargs = geth_dev.geth_kwargs
+    assert kwargs.get("rpc_addr") is None
+    assert kwargs["ws_enabled"] is True
+    assert kwargs["ws_addr"] == "localhost"
+    assert kwargs["ws_port"] == "6799"
+
+
+@geth_process_test
+def test_geth_dev_from_uri_ipc(data_folder):
+    geth_dev = GethDevProcess.from_uri("path/to/geth.ipc", data_folder)
+    kwargs = geth_dev.geth_kwargs
+    assert kwargs["ipc_path"] == "path/to/geth.ipc"
+    assert kwargs.get("ws_api") is None
+    assert kwargs.get("ws_addr") is None
+    assert kwargs.get("rpc_addr") is None
+
+
+@geth_process_test
+def test_geth_dev_block_period(data_folder):
+    geth_dev = GethDevProcess.from_uri(
+        "path/to/geth.ipc",
+        data_folder,
+        block_time=1,
+        generate_accounts=False,
+        initialize_chain=False,
+    )
+    assert geth_dev.geth_kwargs["dev_period"] == "1"
+
+
+def test_geth_dev_disconnect_does_not_delete_unrelated_files_in_given_data_dir():
+    """
+    One time, I used a data-dir containing other files I didn't want to lose. GethDevProcess
+    deleted the entire folder during `.disconnect()`, and it was tragic. Ensure this does
+    not happen to anyone else.
+    """
+    with create_tempdir() as temp_dir:
+        file = temp_dir / "dont_delete_me_plz.txt"
+        file.write_text("Please don't delete me.")
+
+        geth_dev = GethDevProcess.from_uri(
+            "path/to/geth.ipc",
+            temp_dir,
+            block_time=1,
+            generate_accounts=False,
+            initialize_chain=False,
+        )
+        geth_dev.disconnect()
+        assert file.is_file()
+        assert not (temp_dir / "genesis.json").is_file()

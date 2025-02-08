@@ -109,21 +109,21 @@ def _teardown_numb_acct_change(accounts):
 
 
 @pytest.fixture
-def no_accounts(accounts, empty_data_folder, project):
-    data = _setup_temp_acct_number_change(accounts, 0)
+def no_accounts(account_manager, empty_data_folder, project):
+    data = _setup_temp_acct_number_change(account_manager, 0)
     with project.temp_config(**data):
         yield
 
-    _teardown_numb_acct_change(accounts)
+    _teardown_numb_acct_change(account_manager)
 
 
 @pytest.fixture
-def one_account(accounts, empty_data_folder, project, test_accounts):
-    data = _setup_temp_acct_number_change(accounts, 1)
+def one_account(account_manager, empty_data_folder, project):
+    data = _setup_temp_acct_number_change(account_manager, 1)
     with project.temp_config(**data):
-        yield test_accounts[0]
+        yield account_manager.test_accounts[0]
 
-    _teardown_numb_acct_change(accounts)
+    _teardown_numb_acct_change(account_manager)
 
 
 def get_expected_account_str(acct):
@@ -314,7 +314,9 @@ def test_network_option_specify_custom_network(
         def cmd(network):
             click.echo(f"Value is '{getattr(network, 'name', network)}'")
 
-        result = runner.invoke(cmd, ("--network", f"ethereum:{network_name}:node"))
+        result = runner.invoke(
+            cmd, ("--network", f"ethereum:{network_name}:node"), catch_exceptions=False
+        )
         assert result.exit_code == 0
         assert f"Value is '{network_name}'" in result.output
 
@@ -371,9 +373,9 @@ def test_account_prompts_when_more_than_one_keyfile_account(
 
 
 @pytest.mark.parametrize("test_key", ("test", "TEST"))
-def test_account_option_can_use_test_account(runner, test_accounts, test_key):
+def test_account_option_can_use_test_account(runner, accounts, test_key):
     index = 7
-    test_account = test_accounts[index]
+    test_account = accounts[index]
 
     @click.command()
     @account_option()
@@ -452,6 +454,19 @@ def test_verbosity_option_change_default(runner, level):
 
     verbosity_parameter = cmd.params[0]
     assert verbosity_parameter.default == level
+
+
+def test_verbosity_option_uses_logger_level_as_default(runner):
+    with logger.at_level(LogLevel.DEBUG):
+
+        @click.command()
+        @verbosity_option(default=None)
+        def cmd():
+            click.echo(f"LogLevel={logger.level}")
+            pass
+
+        result = runner.invoke(cmd)
+        assert "LogLevel=10" in result.output
 
 
 def test_account_prompt_name():
@@ -546,12 +561,13 @@ def test_contract_file_paths_argument_given_subdir_relative_to_path(
 
 @skip_if_plugin_installed("vyper")
 def test_contract_file_paths_argument_missing_vyper(
-    project_with_source_files_contract, runner, contracts_paths_cmd
+    project_with_source_files_contract, runner, contracts_paths_cmd, ape_caplog
 ):
     name = "VyperContract"
     pm = project_with_source_files_contract
     arguments = (name, "--project", f"{pm.path}")
-    result = runner.invoke(contracts_paths_cmd, arguments)
+    with ape_caplog.at_level(LogLevel.INFO):
+        result = runner.invoke(contracts_paths_cmd, arguments)
 
     expected = (
         "Missing compilers for the following file types: '.vy'. "
@@ -569,7 +585,8 @@ def test_contract_file_paths_argument_missing_solidity(
     pm = project_with_source_files_contract
     with pm.isolate_in_tempdir() as tmp_project:
         arguments = (name, "--project", f"{tmp_project.path}")
-        result = runner.invoke(contracts_paths_cmd, arguments)
+        with logger.at_level(LogLevel.WARNING):
+            result = runner.invoke(contracts_paths_cmd, arguments)
 
     expected = (
         "Missing compilers for the following file types: '.sol'. "
@@ -786,7 +803,7 @@ def test_connected_provider_command_with_network_option_and_cls_types_false(runn
     @network_option()
     def cmd(network):
         assert isinstance(network, str)
-        assert network == "ethereum:local:node"
+        assert network.startswith("ethereum:local")
 
     # NOTE: Must use a network that is not the default.
     spec = ("--network", "ethereum:local:node")

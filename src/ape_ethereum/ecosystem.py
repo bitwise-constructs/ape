@@ -2,8 +2,10 @@ import re
 from collections.abc import Iterator, Sequence
 from decimal import Decimal
 from functools import cached_property
-from typing import Any, ClassVar, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union, cast
 
+import rlp  # type: ignore
+from cchecksum import to_checksum_address
 from eth_abi import decode, encode
 from eth_abi.exceptions import InsufficientDataBytes, NonEmptyPaddingBytes
 from eth_pydantic_types import HexBytes
@@ -17,16 +19,15 @@ from eth_utils import (
     is_hex_address,
     keccak,
     to_bytes,
-    to_checksum_address,
     to_hex,
 )
-from ethpm_types import ContractType
 from ethpm_types.abi import ABIType, ConstructorABI, EventABI, MethodABI
 from pydantic import Field, computed_field, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 
-from ape.api import BlockAPI, EcosystemAPI, PluginConfig, ReceiptAPI, TraceAPI, TransactionAPI
-from ape.api.networks import LOCAL_NETWORK_NAME
+from ape.api.config import PluginConfig
+from ape.api.networks import EcosystemAPI
+from ape.api.providers import BlockAPI
 from ape.contracts.base import ContractCall
 from ape.exceptions import (
     ApeException,
@@ -34,35 +35,28 @@ from ape.exceptions import (
     ConversionError,
     CustomError,
     DecodingError,
-    ProviderError,
     SignatureError,
 )
 from ape.logging import logger
 from ape.managers.config import merge_configs
-from ape.types import (
-    AddressType,
-    AutoGasLimit,
-    ContractLog,
-    CurrencyValueComparable,
-    GasLimit,
-    HexInt,
-    RawAddress,
-    TransactionSignature,
-)
-from ape.utils import (
+from ape.types.address import AddressType, RawAddress
+from ape.types.basic import HexInt
+from ape.types.events import ContractLog
+from ape.types.gas import AutoGasLimit, GasLimit
+from ape.types.signatures import TransactionSignature
+from ape.types.units import CurrencyValueComparable
+from ape.utils.abi import LogInputABICollection, Struct, StructParser, is_array, returns_array
+from ape.utils.basemodel import _assert_not_ipython_check, only_raise_attribute_error
+from ape.utils.misc import (
     DEFAULT_LIVE_NETWORK_BASE_FEE_MULTIPLIER,
     DEFAULT_LOCAL_TRANSACTION_ACCEPTANCE_TIMEOUT,
+    DEFAULT_MAX_RETRIES_TX,
     DEFAULT_TRANSACTION_ACCEPTANCE_TIMEOUT,
+    DEFAULT_TRANSACTION_TYPE,
     EMPTY_BYTES32,
+    LOCAL_NETWORK_NAME,
     ZERO_ADDRESS,
-    LogInputABICollection,
-    Struct,
-    StructParser,
-    is_array,
-    returns_array,
 )
-from ape.utils.basemodel import _assert_not_ipython_check, only_raise_attribute_error
-from ape.utils.misc import DEFAULT_MAX_RETRIES_TX, DEFAULT_TRANSACTION_TYPE
 from ape_ethereum.proxies import (
     IMPLEMENTATION_ABI,
     MASTER_COPY_ABI,
@@ -82,6 +76,13 @@ from ape_ethereum.transactions import (
     TransactionStatusEnum,
     TransactionType,
 )
+
+if TYPE_CHECKING:
+    from ethpm_types import ContractType
+
+    from ape.api.trace import TraceAPI
+    from ape.api.transactions import ReceiptAPI, TransactionAPI
+
 
 NETWORKS = {
     # chain_id, network_id
@@ -147,8 +148,16 @@ class NetworkConfig(PluginConfig):
     base_fee_multiplier: float = 1.0
     """A multiplier to apply to a transaction base fee."""
 
+    is_mainnet: Optional[bool] = None
+    """
+    Set to ``True`` to declare as a mainnet or ``False`` to ensure
+    it isn't detected as one.
+    """
+
     request_headers: dict = {}
     """Optionally config extra request headers whenever using this network."""
+
+    model_config = SettingsConfigDict(extra="allow", env_prefix="APE_ETHEREUM_")
 
     @field_validator("gas_limit", mode="before")
     @classmethod
@@ -226,7 +235,7 @@ class BaseEthereumConfig(PluginConfig):
     # NOTE: This gets appended to Ape's root User-Agent string.
     request_headers: dict = {}
 
-    model_config = SettingsConfigDict(extra="allow")
+    model_config = SettingsConfigDict(extra="allow", env_prefix="APE_ETHEREUM_")
 
     @model_validator(mode="before")
     @classmethod
@@ -415,7 +424,7 @@ class Ethereum(EcosystemAPI):
     def encode_address(cls, address: AddressType) -> RawAddress:
         return f"{address}"
 
-    def decode_transaction_type(self, transaction_type_id: Any) -> type[TransactionAPI]:
+    def decode_transaction_type(self, transaction_type_id: Any) -> type["TransactionAPI"]:
         if isinstance(transaction_type_id, TransactionType):
             tx_type = transaction_type_id
         elif isinstance(transaction_type_id, int):
@@ -432,8 +441,8 @@ class Ethereum(EcosystemAPI):
         return DynamicFeeTransaction
 
     def encode_contract_blueprint(
-        self, contract_type: ContractType, *args, **kwargs
-    ) -> TransactionAPI:
+        self, contract_type: "ContractType", *args, **kwargs
+    ) -> "TransactionAPI":
         # EIP-5202 implementation.
         bytes_obj = contract_type.deployment_bytecode
         contract_bytes = (bytes_obj.to_bytes() or b"") if bytes_obj else b""
@@ -451,12 +460,11 @@ class Ethereum(EcosystemAPI):
         )
 
     def get_proxy_info(self, address: AddressType) -> Optional[ProxyInfo]:
-        contract_code = self.provider.get_code(address)
+        contract_code = self.chain_manager.get_code(address)
         if isinstance(contract_code, bytes):
             contract_code = to_hex(contract_code)
 
-        code = contract_code[2:]
-        if not code:
+        if not (code := contract_code[2:]):
             return None
 
         patterns = {
@@ -508,21 +516,20 @@ class Ethereum(EcosystemAPI):
             if _type == ProxyType.Beacon:
                 target = ContractCall(IMPLEMENTATION_ABI, target)(skip_trace=True)
 
-            return ProxyInfo(type=_type, target=target)
+            return ProxyInfo(type=_type, target=target, abi=IMPLEMENTATION_ABI)
 
         # safe >=1.1.0 provides `masterCopy()`, which is also stored in slot 0
-        # detect safe-specific bytecode of push32 keccak256("masterCopy()")
-        safe_pattern = b"\x7f" + keccak(text="masterCopy()")[:4] + bytes(28)
-        if to_hex(safe_pattern) in code:
-            try:
-                singleton = ContractCall(MASTER_COPY_ABI, address)(skip_trace=True)
-                slot_0 = self.provider.get_storage(address, 0)
-                target = self.conversion_manager.convert(slot_0[-20:], AddressType)
-                # NOTE: `target` is set in initialized proxies
-                if target != ZERO_ADDRESS and target == singleton:
-                    return ProxyInfo(type=ProxyType.GnosisSafe, target=target)
-            except ApeException:
-                pass
+        # call it and check that target matches
+        try:
+            singleton = ContractCall(MASTER_COPY_ABI, address)(skip_trace=True)
+            slot_0 = self.provider.get_storage(address, 0)
+            target = self.conversion_manager.convert(slot_0[-20:], AddressType)
+            # NOTE: `target` is set in initialized proxies
+            if target != ZERO_ADDRESS and target == singleton:
+                return ProxyInfo(type=ProxyType.GnosisSafe, target=target, abi=MASTER_COPY_ABI)
+
+        except ApeException:
+            pass
 
         # eip-897 delegate proxy, read `proxyType()` and `implementation()`
         # perf: only make a call when a proxyType() selector is mentioned in the code
@@ -536,14 +543,14 @@ class Ethereum(EcosystemAPI):
                 target = ContractCall(IMPLEMENTATION_ABI, address)(skip_trace=True)
                 # avoid recursion
                 if target != ZERO_ADDRESS:
-                    return ProxyInfo(type=ProxyType.Delegate, target=target)
+                    return ProxyInfo(type=ProxyType.Delegate, target=target, abi=IMPLEMENTATION_ABI)
 
             except (ApeException, ValueError):
                 pass
 
         return None
 
-    def decode_receipt(self, data: dict) -> ReceiptAPI:
+    def decode_receipt(self, data: dict) -> "ReceiptAPI":
         status = data.get("status")
         if status is not None:
             status = self.conversion_manager.convert(status, int)
@@ -584,20 +591,15 @@ class Ethereum(EcosystemAPI):
         }
 
         receipt_cls: type[Receipt]
-        if any(
-            x in data
-            for x in (
-                "blobGasPrice",
-                "blobGasUsed",
-                "blobVersionedHashes",
-                "maxFeePerBlobGas",
-                "blob_gas_price",
-                "blob_gas_used",
-            )
-        ):
+        if data.get("type") == 3:
             receipt_cls = SharedBlobReceipt
-            receipt_kwargs["blobGasPrice"] = data.get("blob_gas_price", data.get("blobGasPrice"))
+            blob_gas_price = data.get("blob_gas_price")
+            if blob_gas_price is None:
+                blob_gas_price = data.get("blobGasPrice")
+
+            receipt_kwargs["blobGasPrice"] = blob_gas_price
             receipt_kwargs["blobGasUsed"] = data.get("blob_gas_used", data.get("blobGasUsed")) or 0
+
         else:
             receipt_cls = Receipt
 
@@ -851,7 +853,7 @@ class Ethereum(EcosystemAPI):
 
         return cast(BaseTransaction, txn)
 
-    def create_transaction(self, **kwargs) -> TransactionAPI:
+    def create_transaction(self, **kwargs) -> "TransactionAPI":
         """
         Returns a transaction using the given constructor kwargs.
 
@@ -889,7 +891,7 @@ class Ethereum(EcosystemAPI):
             tx_data["data"] = b""
 
         # Deduce the transaction type.
-        transaction_types: dict[TransactionType, type[TransactionAPI]] = {
+        transaction_types: dict[TransactionType, type["TransactionAPI"]] = {
             TransactionType.STATIC: StaticFeeTransaction,
             TransactionType.ACCESS_LIST: AccessListTransaction,
             TransactionType.DYNAMIC: DynamicFeeTransaction,
@@ -960,7 +962,7 @@ class Ethereum(EcosystemAPI):
 
         return txn_class.model_validate(tx_data)
 
-    def decode_logs(self, logs: Sequence[dict], *events: EventABI) -> Iterator["ContractLog"]:
+    def decode_logs(self, logs: Sequence[dict], *events: EventABI) -> Iterator[ContractLog]:
         if not logs:
             return
 
@@ -1039,7 +1041,7 @@ class Ethereum(EcosystemAPI):
                 ),
             )
 
-    def enrich_trace(self, trace: TraceAPI, **kwargs) -> TraceAPI:
+    def enrich_trace(self, trace: "TraceAPI", **kwargs) -> "TraceAPI":
         kwargs["trace"] = trace
         if not isinstance(trace, Trace):
             # Can only enrich `ape_ethereum.trace.Trace` (or subclass) implementations.
@@ -1150,12 +1152,15 @@ class Ethereum(EcosystemAPI):
             except KeyError:
                 name = call["method_id"]
             else:
-                assert isinstance(method_abi, MethodABI)  # For mypy
-
-                # Check if method name duplicated. If that is the case, use selector.
-                times = len([x for x in contract_type.methods if x.name == method_abi.name])
-                name = (method_abi.name if times == 1 else method_abi.selector) or call["method_id"]
-                call = self._enrich_calldata(call, method_abi, **kwargs)
+                if isinstance(method_abi, MethodABI):
+                    # Check if method name duplicated. If that is the case, use selector.
+                    times = len([x for x in contract_type.methods if x.name == method_abi.name])
+                    name = (method_abi.name if times == 1 else method_abi.selector) or call[
+                        "method_id"
+                    ]
+                    call = self._enrich_calldata(call, method_abi, **kwargs)
+                else:
+                    name = call.get("method_id") or "0x"
         else:
             name = call.get("method_id") or "0x"
 
@@ -1403,7 +1408,7 @@ class Ethereum(EcosystemAPI):
 
     def _get_contract_type_for_enrichment(
         self, address: AddressType, **kwargs
-    ) -> Optional[ContractType]:
+    ) -> Optional["ContractType"]:
         if not (contract_type := kwargs.get("contract_type")):
             try:
                 contract_type = self.chain_manager.contracts.get(address)
@@ -1458,7 +1463,7 @@ class Ethereum(EcosystemAPI):
         try:
             if not (last_addr := next(trace.get_addresses_used(reverse=True), None)):
                 return None
-        except ProviderError:
+        except Exception:
             # When unable to get trace-frames properly, such as eth-tester.
             return None
 
@@ -1475,6 +1480,17 @@ class Ethereum(EcosystemAPI):
 
         # error never found.
         return None
+
+    def get_deployment_address(self, address: AddressType, nonce: int) -> AddressType:
+        """
+        Calculate the deployment address of a contract before it is deployed.
+        This is useful if the address is an argument to another contract's deployment
+        and you have not yet deployed the first contract yet.
+        """
+        sender_bytes = to_bytes(hexstr=address)
+        encoded = rlp.encode([sender_bytes, nonce])
+        address_bytes = keccak(encoded)[12:]
+        return self.decode_address(address_bytes)
 
 
 def parse_type(type_: dict[str, Any]) -> Union[str, tuple, list]:

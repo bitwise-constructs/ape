@@ -1,8 +1,14 @@
+"""
+TODO: In 0.9, move this module to `ape.types`.
+"""
+
 import inspect
 from abc import ABC
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from importlib import import_module
+from pathlib import Path
 from sys import getrecursionlimit
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union
 
 from ethpm_types import BaseModel as EthpmTypesBaseModel
 from pydantic import BaseModel as RootBaseModel
@@ -32,8 +38,21 @@ class classproperty(object):
     def __init__(self, fn: Callable):
         self.fn = fn
 
-    def __get__(self, obj, owner):
+    def __get__(self, obj, owner) -> Any:
         return self.fn(owner)
+
+
+class manager_access(property):
+    _cache = None
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __get__(self, obj, owner) -> Any:  # type: ignore[override]
+        if self._cache is None:
+            self._cache = self.fn(owner)
+
+        return self._cache
 
 
 class _RecursionChecker:
@@ -66,6 +85,7 @@ class _RecursionChecker:
 _recursion_checker = _RecursionChecker()
 
 
+# TODO: Delete in 0.9 (deprecated & no longer used anywhere)
 class injected_before_use(property):
     """
     Injected properties are injected class variables that must be set before use.
@@ -108,30 +128,101 @@ def only_raise_attribute_error(fn: Callable) -> Any:
 
 
 class ManagerAccessMixin:
-    # NOTE: cast is used to update the class type returned to mypy
-    account_manager: ClassVar["AccountManager"] = cast("AccountManager", injected_before_use())
+    """
+    A mixin for accessing Ape's manager at the class level.
 
-    chain_manager: ClassVar["ChainManager"] = cast("ChainManager", injected_before_use())
+    Usage example:
 
-    compiler_manager: ClassVar["CompilerManager"] = cast("CompilerManager", injected_before_use())
+        from ape.utils import ManagerAccessMixin
 
-    config_manager: ClassVar["ConfigManager"] = cast("ConfigManager", injected_before_use())
-
-    conversion_manager: ClassVar["ConversionManager"] = cast(
-        "ConversionManager", injected_before_use()
-    )
-
-    local_project: ClassVar["ProjectManager"] = cast("ProjectManager", injected_before_use())
-
-    network_manager: ClassVar["NetworkManager"] = cast("NetworkManager", injected_before_use())
-
-    plugin_manager: ClassVar["PluginManager"] = cast("PluginManager", injected_before_use())
-
-    Project: ClassVar[type["ProjectManager"]] = cast(type["ProjectManager"], injected_before_use())
-
-    query_manager: ClassVar["QueryManager"] = cast("QueryManager", injected_before_use())
+        class MyClass(ManagerAccessMixin):
+            def my_function(self):
+                accounts = self.account_manager  # And so on!
+    """
 
     _test_runner: ClassVar[Optional["PytestApeRunner"]] = None
+
+    @manager_access
+    def account_manager(cls) -> "AccountManager":
+        """
+        The :class:`~ape.managers.accounts.AccountManager`.
+        """
+        accounts = import_module("ape.managers.accounts")
+        return accounts.AccountManager()
+
+    @manager_access
+    def chain_manager(cls) -> "ChainManager":
+        """
+        The :class:`~ape.managers.chain.ChainManager`.
+        """
+        chain = import_module("ape.managers.chain")
+        return chain.ChainManager()
+
+    @manager_access
+    def compiler_manager(cls) -> "CompilerManager":
+        """
+        The :class:`~ape.managers.compilers.CompilerManager`.
+        """
+        compilers = import_module("ape.managers.compilers")
+        return compilers.CompilerManager()
+
+    @manager_access
+    def config_manager(cls) -> "ConfigManager":
+        """
+        The :class:`~ape.managers.config.ConfigManager`.
+        """
+        config = import_module("ape.managers.config")
+        return config.ConfigManager()
+
+    @manager_access
+    def conversion_manager(cls) -> "ConversionManager":
+        """
+        The :class:`~ape.managers.converters.ConversionManager`.
+        """
+        converters = import_module("ape.managers.converters")
+        return converters.ConversionManager()
+
+    @manager_access
+    def local_project(cls) -> "ProjectManager":
+        """
+        A :class:`~ape.managers.project.ProjectManager` pointed
+        at the current-working directory.
+        """
+        project = import_module("ape.managers.project")
+        return project.ProjectManager(Path.cwd())
+
+    @manager_access
+    def network_manager(cls) -> "NetworkManager":
+        """
+        The :class:`~ape.managers.networks.NetworkManager`.
+        """
+        networks = import_module("ape.managers.networks")
+        return networks.NetworkManager()
+
+    @manager_access
+    def plugin_manager(cls) -> "PluginManager":
+        """
+        The :class:`~ape.managers.plugins.PluginManager`.
+        """
+        plugins = import_module("ape.managers.plugins")
+        return plugins.PluginManager()
+
+    @classproperty
+    def Project(cls) -> type["ProjectManager"]:
+        """
+        The ``Project`` factory class for creating
+        other local-projects.
+        """
+        project = import_module("ape.managers.project")
+        return project.ProjectManager
+
+    @manager_access
+    def query_manager(cls) -> "QueryManager":
+        """
+        The :class:`~ape.managers.query.QueryManager`.
+        """
+        query = import_module("ape.managers.query")
+        return query.QueryManager()
 
     @classproperty
     def provider(cls) -> "ProviderAPI":
@@ -319,7 +410,7 @@ class BaseModel(EthpmTypesBaseModel):
     def model_copy(
         self: "Model",
         *,
-        update: Optional[dict[str, Any]] = None,
+        update: Optional[Mapping[str, Any]] = None,
         deep: bool = False,
         cache_clear: Optional[Sequence[str]] = None,
     ) -> "Model":
@@ -414,6 +505,10 @@ def get_attribute_with_extras(obj: Any, name: str) -> Any:
     if res is not None:
         _recursion_checker.reset(name)
         return res
+
+    if name.startswith("__") and name.endswith("__"):
+        # Don't seek double-dunderized definitions from extras.
+        raise AttributeError(name)
 
     # NOTE: Do not check extras within the error handler to avoid
     #   errors occurring within an exception handler (Python shows that differently).
@@ -519,3 +614,59 @@ class BaseInterfaceModel(BaseInterface, BaseModel):
         """
         # Filter out protected/private members
         return [member for member in super().__dir__() if not member.startswith("_")]
+
+
+class DiskCacheableModel(BaseModel):
+    """
+    A model with extra utilities for caching to disk.
+    """
+
+    def __init__(self, *args, **kwargs):
+        path = kwargs.pop("path", None)
+        super().__init__(*args, **kwargs)
+        self._path = path
+
+    def model_dump_file(self, path: Optional[Path] = None, **kwargs):
+        """
+        Save this model to disk.
+
+        Args:
+            path (Optional[Path]): Optionally provide the path now
+              if one wasn't declared at init time. If given a directory,
+              saves the file in that dir with the name of class with a
+              .json suffix.
+            **kwargs: Extra kwargs to pass to ``.model_dump_json()``.
+        """
+        path = self._get_path(path=path)
+        json_str = self.model_dump_json(**kwargs)
+        path.unlink(missing_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json_str)
+
+    @classmethod
+    def model_validate_file(cls, path: Path, **kwargs):
+        """
+        Validate a file.
+
+        Args:
+            path (Optional[Path]): Optionally provide the path now
+              if one wasn't declared at init time.
+            **kwargs: Extra kwargs to pass to ``.model_validate_json()``.
+        """
+        if json_str := path.read_text(encoding="utf8") if path.is_file() else "":
+            model = cls.model_validate_json(json_str, **kwargs)
+        else:
+            model = cls.model_validate({})
+
+        model._path = path
+        return model
+
+    def _get_path(self, path: Optional[Path] = None) -> Path:
+        if save_path := (path or self._path):
+            return save_path
+
+        elif save_path.is_dir():
+            name = self.__class__.__name__ or "Model"
+            return save_path / f"{name}.json"
+
+        raise ValueError("Unknown path for caching.")

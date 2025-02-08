@@ -1,28 +1,28 @@
 import json
-from typing import Optional
+from importlib import import_module
+from typing import TYPE_CHECKING, Optional
 
 import click
-from eth_account import Account as EthAccount
-from eth_account.hdaccount import ETHEREUM_DEFAULT_PATH
-from eth_utils import to_checksum_address, to_hex
+from cchecksum import to_checksum_address
+from eth_utils import to_hex
 
-from ape.cli import ape_cli_context, existing_alias_argument, non_existing_alias_argument
+from ape.cli.arguments import existing_alias_argument, non_existing_alias_argument
+from ape.cli.options import ape_cli_context
 from ape.logging import HIDDEN_MESSAGE
-from ape.utils.basemodel import ManagerAccessMixin
-from ape_accounts import (
-    AccountContainer,
-    KeyfileAccount,
-    generate_account,
-    import_account_from_mnemonic,
-    import_account_from_private_key,
-)
+
+if TYPE_CHECKING:
+    from ape.api.accounts import AccountAPI
+    from ape_accounts.accounts import AccountContainer, KeyfileAccount
 
 
-def _get_container() -> AccountContainer:
+ETHEREUM_DEFAULT_PATH = "m/44'/60'/0'/0/0"
+
+
+def _get_container() -> "AccountContainer":
+    from ape.utils.basemodel import ManagerAccessMixin as access
+
     # NOTE: Must used the instantiated version of `AccountsContainer` in `accounts`
-    container = ManagerAccessMixin.account_manager.containers["accounts"]
-    assert isinstance(container, AccountContainer)
-    return container
+    return access.account_manager.containers["accounts"]
 
 
 @click.group(short_help="Manage local accounts")
@@ -109,7 +109,10 @@ def generate(cli_ctx, alias, hide_mnemonic, word_count, custom_hd_path):
         confirmation_prompt=True,
     )
 
-    account, mnemonic = generate_account(alias, passphrase, custom_hd_path, word_count)
+    account_module = import_module("ape_accounts.accounts")
+    account, mnemonic = account_module.generate_account(
+        alias, passphrase, custom_hd_path, word_count
+    )
 
     if show_mnemonic:
         cli_ctx.logger.info(f"Newly generated mnemonic is: {click.style(mnemonic, bold=True)}")
@@ -135,7 +138,7 @@ def generate(cli_ctx, alias, hide_mnemonic, word_count, custom_hd_path):
 )
 @non_existing_alias_argument()
 def _import(cli_ctx, alias, import_from_mnemonic, custom_hd_path):
-    account: Optional[KeyfileAccount] = None
+    account: Optional["KeyfileAccount"] = None
 
     def ask_for_passphrase():
         return click.prompt(
@@ -145,11 +148,13 @@ def _import(cli_ctx, alias, import_from_mnemonic, custom_hd_path):
         )
 
     if import_from_mnemonic:
+        from eth_account import Account as EthAccount
+
         mnemonic = click.prompt("Enter mnemonic seed phrase", hide_input=True)
         EthAccount.enable_unaudited_hdwallet_features()
         try:
             passphrase = ask_for_passphrase()
-            account = import_account_from_mnemonic(alias, passphrase, mnemonic, custom_hd_path)
+            account = _account_from_mnemonic(alias, passphrase, mnemonic, hd_path=custom_hd_path)
         except Exception as error:
             error_msg = f"{error}".replace(mnemonic, HIDDEN_MESSAGE)
             cli_ctx.abort(f"Seed phrase can't be imported: {error_msg}")
@@ -158,7 +163,7 @@ def _import(cli_ctx, alias, import_from_mnemonic, custom_hd_path):
         key = click.prompt("Enter Private Key", hide_input=True)
         try:
             passphrase = ask_for_passphrase()
-            account = import_account_from_private_key(alias, passphrase, key)
+            account = _account_from_key(alias, passphrase, key)
         except Exception as error:
             cli_ctx.abort(f"Key can't be imported: {error}")
 
@@ -168,10 +173,29 @@ def _import(cli_ctx, alias, import_from_mnemonic, custom_hd_path):
         )
 
 
+def _load_account_type(account: "AccountAPI") -> bool:
+    module = import_module("ape_accounts.accounts")
+    return isinstance(account, module.KeyfileAccount)
+
+
+def _account_from_mnemonic(
+    alias: str, passphrase: str, mnemonic: str, hd_path: str = ETHEREUM_DEFAULT_PATH
+) -> "KeyfileAccount":
+    account_module = import_module("ape_accounts.accounts")
+    return account_module.import_account_from_mnemonic(alias, passphrase, mnemonic, hd_path=hd_path)
+
+
+def _account_from_key(alias: str, passphrase: str, key: str) -> "KeyfileAccount":
+    account_module = import_module("ape_accounts.accounts")
+    return account_module.import_account_from_private_key(alias, passphrase, key)
+
+
 @cli.command(short_help="Export an account private key")
 @ape_cli_context()
-@existing_alias_argument(account_type=KeyfileAccount)
+@existing_alias_argument(account_type=_load_account_type)
 def export(cli_ctx, alias):
+    from eth_account import Account as EthAccount
+
     path = _get_container().data_folder.joinpath(f"{alias}.json")
     account = json.loads(path.read_text())
     password = click.prompt("Enter password to decrypt account", hide_input=True)
@@ -184,19 +208,17 @@ def export(cli_ctx, alias):
 
 @cli.command(short_help="Change the password of an existing account")
 @ape_cli_context()
-@existing_alias_argument(account_type=KeyfileAccount)
+@existing_alias_argument(account_type=_load_account_type)
 def change_password(cli_ctx, alias):
     account = cli_ctx.account_manager.load(alias)
-    assert isinstance(account, KeyfileAccount)
     account.change_password()
     cli_ctx.logger.success(f"Password has been changed for account '{alias}'")
 
 
 @cli.command(short_help="Delete an existing account")
 @ape_cli_context()
-@existing_alias_argument(account_type=KeyfileAccount)
+@existing_alias_argument(account_type=_load_account_type)
 def delete(cli_ctx, alias):
     account = cli_ctx.account_manager.load(alias)
-    assert isinstance(account, KeyfileAccount)
     account.delete()
     cli_ctx.logger.success(f"Account '{alias}' has been deleted")

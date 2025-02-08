@@ -1,11 +1,16 @@
+from typing import TYPE_CHECKING
+
 import pytest
+from eth_utils import to_hex
 from rich.table import Table
 from rich.tree import Tree
 
-from ape.api import ReceiptAPI
 from ape.exceptions import ContractLogicError, OutOfGasError
 from ape.utils import ManagerAccessMixin
 from ape_ethereum.transactions import DynamicFeeTransaction, Receipt, TransactionStatusEnum
+
+if TYPE_CHECKING:
+    from ape.api import ReceiptAPI
 
 
 @pytest.fixture
@@ -83,6 +88,25 @@ def test_show_events(trace_print_capture, invoke_receipt):
     assert "newNum=[bright_magenta]1" in label
 
 
+def test_decode_logs(owner, contract_instance, assert_log_values):
+    event_type = contract_instance.NumberChange
+
+    # Invoke a transaction 3 times that generates 3 logs.
+    receipt_0 = contract_instance.setNumber(1, sender=owner)
+    receipt_1 = contract_instance.setNumber(2, sender=owner)
+    receipt_2 = contract_instance.setNumber(3, sender=owner)
+
+    def assert_receipt_logs(receipt: "ReceiptAPI", num: int):
+        logs = receipt.decode_logs(event_type)
+        assert len(logs) == 1
+        assert_log_values(logs[0], num)
+        assert receipt.timestamp == logs[0].timestamp
+
+    assert_receipt_logs(receipt_0, 1)
+    assert_receipt_logs(receipt_1, 2)
+    assert_receipt_logs(receipt_2, 3)
+
+
 def test_decode_logs_specify_abi(invoke_receipt, vyper_contract_instance):
     abi = vyper_contract_instance.NumberChange.abi
     logs = invoke_receipt.decode_logs(abi=abi)
@@ -107,6 +131,47 @@ def test_decode_logs_specify_abi_as_event(
 
     # Tests against a bug where the API was called unnecessarily
     assert spy.call_count == 0
+
+
+def test_decode_logs_multiple_event_types(owner, contract_instance, assert_log_values):
+    foo_happened = contract_instance.FooHappened
+    bar_happened = contract_instance.BarHappened
+    receipt = contract_instance.fooAndBar(sender=owner)
+    logs = receipt.decode_logs([foo_happened, bar_happened])
+    assert len(logs) == 2
+    assert logs[0].foo == 0
+    assert logs[1].bar == 1
+
+
+def test_decode_logs_not_checksummed_addresses(owner, contract_instance, assert_log_values):
+    """
+    If an RPC returns non-checksummed logs with non-checksummed addresses,
+    show we can still decode them.
+    """
+    start_number = contract_instance.myNumber()
+    tx = contract_instance.setNumber(1, sender=owner)
+    assert len(tx.logs) == 1
+
+    # Hack to make the address lower-case.
+    tx.logs[0]["address"] = tx.logs[0]["address"].lower()
+
+    events = tx.decode_logs()
+    assert len(events) == 1
+    assert_log_values(events[0], 1, start_number)
+
+
+def test_decode_logs_unspecified_abi_gets_all_logs(owner, contract_instance):
+    receipt = contract_instance.fooAndBar(sender=owner)
+    logs = receipt.decode_logs()  # Same as doing `receipt.events`
+    assert len(logs) == 2
+    assert logs[0].foo == 0
+    assert logs[1].bar == 1
+
+
+def test_events(owner, contract_instance, assert_log_values):
+    receipt = contract_instance.setNumber(1, sender=owner)
+    assert len(receipt.events) == 1
+    assert_log_values(receipt.events[0], 1)
 
 
 def test_events_with_ds_notes(ds_note_test_contract, owner):
@@ -137,49 +202,6 @@ def test_events_with_ds_notes(ds_note_test_contract, owner):
     assert receipt.events[0].event_arguments == {"a": 1, "b": 2, "c": 3}
     assert receipt.events[0].log_index == 0
     assert receipt.events[0].transaction_index == 0
-
-
-def test_decode_logs(owner, contract_instance, assert_log_values):
-    event_type = contract_instance.NumberChange
-
-    # Invoke a transaction 3 times that generates 3 logs.
-    receipt_0 = contract_instance.setNumber(1, sender=owner)
-    receipt_1 = contract_instance.setNumber(2, sender=owner)
-    receipt_2 = contract_instance.setNumber(3, sender=owner)
-
-    def assert_receipt_logs(receipt: ReceiptAPI, num: int):
-        logs = receipt.decode_logs(event_type)
-        assert len(logs) == 1
-        assert_log_values(logs[0], num)
-        assert receipt.timestamp == logs[0].timestamp
-
-    assert_receipt_logs(receipt_0, 1)
-    assert_receipt_logs(receipt_1, 2)
-    assert_receipt_logs(receipt_2, 3)
-
-
-def test_events(owner, contract_instance, assert_log_values):
-    receipt = contract_instance.setNumber(1, sender=owner)
-    assert len(receipt.events) == 1
-    assert_log_values(receipt.events[0], 1)
-
-
-def test_decode_logs_multiple_event_types(owner, contract_instance, assert_log_values):
-    foo_happened = contract_instance.FooHappened
-    bar_happened = contract_instance.BarHappened
-    receipt = contract_instance.fooAndBar(sender=owner)
-    logs = receipt.decode_logs([foo_happened, bar_happened])
-    assert len(logs) == 2
-    assert logs[0].foo == 0
-    assert logs[1].bar == 1
-
-
-def test_decode_logs_unspecified_abi_gets_all_logs(owner, contract_instance):
-    receipt = contract_instance.fooAndBar(sender=owner)
-    logs = receipt.decode_logs()  # Same as doing `receipt.events`
-    assert len(logs) == 2
-    assert logs[0].foo == 0
-    assert logs[1].bar == 1
 
 
 def test_get_failed_receipt(owner, vyper_contract_instance, eth_tester_provider):
@@ -247,6 +269,13 @@ def test_track_coverage(deploy_receipt, mocker):
 def test_access_from_tx(deploy_receipt):
     actual = deploy_receipt.transaction.receipt
     assert actual == deploy_receipt
+
+
+def test_transaction(owner, vyper_contract_instance):
+    receipt = vyper_contract_instance.setNumber(1999, sender=owner)
+    actual = receipt.transaction
+    assert actual.sender == owner.address
+    assert to_hex(actual.txn_hash) == receipt.txn_hash
 
 
 def test_transaction_validated_from_dict(ethereum, owner, deploy_receipt):

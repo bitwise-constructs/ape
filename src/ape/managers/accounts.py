@@ -1,6 +1,7 @@
 import contextlib
 from collections.abc import Generator, Iterator
 from contextlib import AbstractContextManager as ContextManager
+from functools import cached_property, singledispatchmethod
 from typing import Optional, Union
 
 from eth_utils import is_hex
@@ -14,8 +15,9 @@ from ape.api.accounts import (
 )
 from ape.exceptions import AccountsError, ConversionError
 from ape.managers.base import BaseManager
-from ape.types import AddressType
-from ape.utils import ManagerAccessMixin, cached_property, log_instead_of_fail, singledispatchmethod
+from ape.types.address import AddressType
+from ape.utils.basemodel import ManagerAccessMixin
+from ape.utils.misc import log_instead_of_fail
 
 _DEFAULT_SENDERS: list[AccountAPI] = []
 
@@ -23,7 +25,7 @@ _DEFAULT_SENDERS: list[AccountAPI] = []
 @contextlib.contextmanager
 def _use_sender(
     account: Union[AccountAPI, TestAccountAPI]
-) -> Generator[AccountAPI, TestAccountAPI, None]:
+) -> "Generator[AccountAPI, TestAccountAPI, None]":
     try:
         _DEFAULT_SENDERS.append(account)
         yield account
@@ -39,8 +41,7 @@ class TestAccountManager(list, ManagerAccessMixin):
 
     @log_instead_of_fail(default="<TestAccountManager>")
     def __repr__(self) -> str:
-        accounts_str = ", ".join([a.address for a in self.accounts])
-        return f"[{accounts_str}]"
+        return f"<apetest-wallet {self.hd_path}>"
 
     @cached_property
     def containers(self) -> dict[str, TestAccountContainerAPI]:
@@ -51,6 +52,13 @@ class TestAccountManager(list, ManagerAccessMixin):
             plugin_name: container_type(name=plugin_name, account_type=account_type)
             for plugin_name, (container_type, account_type) in account_types
         }
+
+    @property
+    def hd_path(self) -> str:
+        """
+        The HD path used for generating the test accounts.
+        """
+        return self.config_manager.get_config("test").hd_path
 
     @property
     def accounts(self) -> Iterator[AccountAPI]:
@@ -74,15 +82,14 @@ class TestAccountManager(list, ManagerAccessMixin):
 
     @__getitem__.register
     def __getitem_int(self, account_id: int):
-        if account_id in self._accounts_by_index:
-            return self._accounts_by_index[account_id]
-
-        original_account_id = account_id
         if account_id < 0:
             account_id = len(self) + account_id
 
+        if account_id in self._accounts_by_index:
+            return self._accounts_by_index[account_id]
+
         account = self.containers["test"].get_test_account(account_id)
-        self._accounts_by_index[original_account_id] = account
+        self._accounts_by_index[account_id] = account
         return account
 
     @__getitem__.register
@@ -158,7 +165,7 @@ class TestAccountManager(list, ManagerAccessMixin):
     def generate_test_account(self, container_name: str = "test") -> TestAccountAPI:
         return self.containers[container_name].generate_account()
 
-    def use_sender(self, account_id: Union[TestAccountAPI, AddressType, int]) -> ContextManager:
+    def use_sender(self, account_id: Union[TestAccountAPI, AddressType, int]) -> "ContextManager":
         account = account_id if isinstance(account_id, TestAccountAPI) else self[account_id]
         return _use_sender(account)
 
@@ -263,7 +270,7 @@ class AccountManager(BaseManager):
 
     @log_instead_of_fail(default="<AccountManager>")
     def __repr__(self) -> str:
-        return "[" + ", ".join(repr(a) for a in self) + "]"
+        return "<AccountManager>"
 
     @cached_property
     def test_accounts(self) -> TestAccountManager:
@@ -410,7 +417,7 @@ class AccountManager(BaseManager):
     def use_sender(
         self,
         account_id: Union[AccountAPI, AddressType, str, int],
-    ) -> ContextManager:
+    ) -> "ContextManager":
         if not isinstance(account_id, AccountAPI):
             if isinstance(account_id, int) or is_hex(account_id):
                 account = self[account_id]

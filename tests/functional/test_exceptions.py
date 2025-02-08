@@ -4,18 +4,18 @@ from typing import Optional
 
 import pytest
 
-from ape.api import ReceiptAPI
-from ape.api.networks import LOCAL_NETWORK_NAME
+from ape.api.transactions import ReceiptAPI
 from ape.exceptions import (
     Abort,
     ContractLogicError,
     ContractNotFoundError,
     NetworkNotFoundError,
     TransactionError,
+    UnknownSnapshotError,
     handle_ape_exception,
 )
-from ape.types import SourceTraceback
-from ape.utils import ZERO_ADDRESS
+from ape.types.trace import SourceTraceback
+from ape.utils.misc import LOCAL_NETWORK_NAME, ZERO_ADDRESS
 from ape_ethereum.transactions import DynamicFeeTransaction, Receipt
 
 
@@ -247,3 +247,15 @@ class TestContractNotFoundError:
             "Try installing an explorer plugin using \x1b[32mape plugins install etherscan"
             "\x1b[0m, or using a network with explorer support."
         )
+
+
+class TestUnknownSnapshotError:
+    def test_bytes(self):
+        snapshot_id = b"asdfasdfasdf"
+        err = UnknownSnapshotError(snapshot_id)
+        assert str(err) == "Unknown snapshot ID '0x6173..6466'."
+
+    @pytest.mark.parametrize("snapshot_id", (123, "123"))
+    def test_not_bytes(self, snapshot_id):
+        err = UnknownSnapshotError(snapshot_id)
+        assert str(err) == "Unknown snapshot ID '123'."

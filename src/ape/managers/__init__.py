@@ -1,26 +1,48 @@
-from pathlib import Path
+def __getattr__(name: str):
+    if name == "AccountManager":
+        from ape.managers.accounts import AccountManager
 
-from ape.utils import USER_AGENT, ManagerAccessMixin
+        return AccountManager
 
-from .accounts import AccountManager
-from .chain import ChainManager
-from .compilers import CompilerManager
-from .config import ConfigManager
-from .converters import ConversionManager
-from .networks import NetworkManager
-from .plugins import PluginManager
-from .project import ProjectManager
-from .query import QueryManager
+    elif name == "ChainManager":
+        from ape.managers.chain import ChainManager
 
-ManagerAccessMixin.plugin_manager = PluginManager()
-ManagerAccessMixin.config_manager = ConfigManager(
-    request_header={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
-)
-ManagerAccessMixin.compiler_manager = CompilerManager()
-ManagerAccessMixin.network_manager = NetworkManager()
-ManagerAccessMixin.query_manager = QueryManager()
-ManagerAccessMixin.conversion_manager = ConversionManager()
-ManagerAccessMixin.chain_manager = ChainManager()
-ManagerAccessMixin.account_manager = AccountManager()
-ManagerAccessMixin.local_project = ProjectManager(Path.cwd())
-ManagerAccessMixin.Project = ProjectManager
+        return ChainManager
+
+    elif name == "CompilerManager":
+        from ape.managers.compilers import CompilerManager
+
+        return CompilerManager
+
+    elif name == "ConfigManager":
+        from ape.managers.config import ConfigManager
+
+        return ConfigManager
+
+    elif name == "ConversionManager":
+        from ape.managers.converters import ConversionManager
+
+        return ConversionManager
+
+    elif name == "NetworkManager":
+        from ape.managers.networks import NetworkManager
+
+        return NetworkManager
+
+    elif name == "PluginManager":
+        from ape.managers.plugins import PluginManager
+
+        return PluginManager
+
+    elif name == "ProjectManager":
+        from ape.managers.project import ProjectManager
+
+        return ProjectManager
+
+    elif name == "QueryManager":
+        from ape.managers.query import QueryManager
+
+        return QueryManager
+
+    else:
+        raise AttributeError(name)

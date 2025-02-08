@@ -1,6 +1,6 @@
 import pytest
 
-from ape.api.networks import LOCAL_NETWORK_NAME
+from ape.utils.misc import LOCAL_NETWORK_NAME
 from tests.conftest import ApeSubprocessRunner, geth_process_test
 
 from .utils import run_once, skip_projects_except
@@ -153,7 +153,7 @@ def test_list_geth(ape_cli, runner, networks, project):
 
 
 @run_once
-def test_list_filter_networks(ape_cli, runner, networks):
+def test_list_filter_networks(ape_cli, runner):
     result = runner.invoke(ape_cli, ("networks", "list", "--network", "sepolia"))
     assert result.exit_code == 0
 
@@ -195,6 +195,22 @@ def test_run_not_subprocess_provider(networks_runner):
 @run_once
 def test_run_custom_network(ape_cli, runner):
     cmd = ("networks", "run", "--network", "ethereum:local:test")
+    result = runner.invoke(ape_cli, cmd)
+    expected = "`ape networks run` requires a provider that manages a process, not 'test'"
+    assert result.exit_code != 0
+    assert expected in result.output
+
+
+@run_once
+def test_run_block_time(ape_cli, runner):
+    cmd = (
+        "networks",
+        "run",
+        "--network",
+        "ethereum:local:test",
+        "--block-time",
+        "10",
+    )
     result = runner.invoke(ape_cli, cmd)
     expected = "`ape networks run` requires a provider that manages a process, not 'test'"
     assert result.exit_code != 0

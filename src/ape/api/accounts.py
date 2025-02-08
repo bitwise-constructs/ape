@@ -1,4 +1,5 @@
 import os
+from abc import abstractmethod
 from collections.abc import Iterator
 from functools import cached_property
 from pathlib import Path
@@ -9,7 +10,6 @@ from eip712.messages import EIP712Message
 from eip712.messages import SignableMessage as EIP712SignableMessage
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from eth_pydantic_types import HexBytes
 from eth_utils import to_hex
 from ethpm_types import ContractType
 
@@ -18,16 +18,21 @@ from ape.api.transactions import ReceiptAPI, TransactionAPI
 from ape.exceptions import (
     AccountsError,
     AliasAlreadyInUseError,
+    ConversionError,
     MethodNonPayableError,
     MissingDeploymentBytecodeError,
     SignatureError,
     TransactionError,
 )
 from ape.logging import logger
-from ape.types import AddressType, MessageSignature, SignableMessage
-from ape.utils import BaseInterfaceModel, abstractmethod, raises_not_implemented
+from ape.types.address import AddressType
+from ape.types.signatures import MessageSignature, SignableMessage
+from ape.utils.basemodel import BaseInterfaceModel
+from ape.utils.misc import raises_not_implemented
 
 if TYPE_CHECKING:
+    from eth_pydantic_types import HexBytes
+
     from ape.contracts import ContractContainer, ContractInstance
 
 
@@ -62,7 +67,7 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
         """
         return None
 
-    def sign_raw_msghash(self, msghash: HexBytes) -> Optional[MessageSignature]:
+    def sign_raw_msghash(self, msghash: "HexBytes") -> Optional[MessageSignature]:
         """
         Sign a raw message hash.
 
@@ -119,6 +124,7 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
         txn: TransactionAPI,
         send_everything: bool = False,
         private: bool = False,
+        sign: bool = True,
         **signer_options,
     ) -> ReceiptAPI:
         """
@@ -138,6 +144,8 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
               Defaults to ``False``.
             private (bool): ``True`` will use the
               :meth:`~ape.api.providers.ProviderAPI.send_private_transaction` method.
+            sign (bool): ``False`` to not sign the transaction (useful for providers like Titanoboa
+              which still use a sender but don't need to sign).
             **signer_options: Additional kwargs given to the signer to modify the signing operation.
 
         Returns:
@@ -172,17 +180,21 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
             else:
                 txn.value = amount_to_send
 
-        signed_txn = self.sign_transaction(txn, **signer_options)
-        if not signed_txn:
-            raise SignatureError("The transaction was not signed.")
+        if sign:
+            prepared_txn = self.sign_transaction(txn, **signer_options)
+            if not prepared_txn:
+                raise SignatureError("The transaction was not signed.")
 
-        if not txn.sender:
-            txn.sender = self.address
+        else:
+            prepared_txn = txn
+
+        if not prepared_txn.sender:
+            prepared_txn.sender = self.address
 
         return (
-            self.provider.send_private_transaction(signed_txn)
+            self.provider.send_private_transaction(prepared_txn)
             if private
-            else self.provider.send_transaction(signed_txn)
+            else self.provider.send_transaction(prepared_txn)
         )
 
     def transfer(
@@ -216,8 +228,18 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
         Returns:
             :class:`~ape.api.transactions.ReceiptAPI`
         """
+        if isinstance(account, int):
+            raise AccountsError(
+                "Cannot use integer-type for the `receiver` argument in the "
+                "`.transfer()` method (this protects against accidentally passing "
+                "the `value` as the `receiver`)."
+            )
 
-        receiver = self.conversion_manager.convert(account, AddressType)
+        try:
+            receiver = self.conversion_manager.convert(account, AddressType)
+        except ConversionError as err:
+            raise AccountsError(f"Invalid `receiver` value: '{account}'.") from err
+
         txn = self.provider.network.ecosystem.create_transaction(
             sender=self.address, receiver=receiver, **kwargs
         )
@@ -390,7 +412,7 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
             :class:`~ape.api.transactions.TransactionAPI`
         """
 
-        # NOTE: Allow overriding nonce, assume user understand what this does
+        # NOTE: Allow overriding nonce, assume user understands what this does
         if txn.nonce is None:
             txn.nonce = self.nonce
         elif txn.nonce < self.nonce:
@@ -411,6 +433,28 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
             )
 
         return txn
+
+    def get_deployment_address(self, nonce: Optional[int] = None) -> AddressType:
+        """
+        Get a contract address before it is deployed. This is useful
+        when you need to pass the contract address to another contract
+        before deploying it.
+
+        Args:
+            nonce (int | None): Optionally provide a nonce. Defaults
+              the account's current nonce.
+
+        Returns:
+            AddressType: The contract address.
+        """
+        # Use the connected network, if available. Else, default to Ethereum.
+        ecosystem = (
+            self.network_manager.active_provider.network.ecosystem
+            if self.network_manager.active_provider
+            else self.network_manager.ethereum
+        )
+        nonce = self.nonce if nonce is None else nonce
+        return ecosystem.get_deployment_address(self.address, nonce)
 
 
 class AccountContainerAPI(BaseInterfaceModel):
@@ -646,7 +690,12 @@ class ImpersonatedAccount(AccountAPI):
         return txn
 
     def call(
-        self, txn: TransactionAPI, send_everything: bool = False, private: bool = False, **kwargs
+        self,
+        txn: TransactionAPI,
+        send_everything: bool = False,
+        private: bool = False,
+        sign: bool = True,
+        **kwargs,
     ) -> ReceiptAPI:
         txn = self.prepare_transaction(txn)
         txn.sender = txn.sender or self.raw_address

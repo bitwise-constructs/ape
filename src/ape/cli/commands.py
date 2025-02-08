@@ -1,16 +1,19 @@
 import inspect
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import click
-from click import Context
 
-from ape.api import ProviderAPI, ProviderContextManager
 from ape.cli.choices import _NONE_NETWORK, NetworkChoice
 from ape.exceptions import NetworkError
-from ape.utils.basemodel import ManagerAccessMixin
+
+if TYPE_CHECKING:
+    from click import Context
+
+    from ape.api.networks import ProviderContextManager
+    from ape.api.providers import ProviderAPI
 
 
-def get_param_from_ctx(ctx: Context, param: str) -> Optional[Any]:
+def get_param_from_ctx(ctx: "Context", param: str) -> Optional[Any]:
     if value := ctx.params.get(param):
         return value
 
@@ -21,7 +24,10 @@ def get_param_from_ctx(ctx: Context, param: str) -> Optional[Any]:
     return None
 
 
-def parse_network(ctx: Context) -> Optional[ProviderContextManager]:
+def parse_network(ctx: "Context") -> Optional["ProviderContextManager"]:
+    from ape.api.providers import ProviderAPI
+    from ape.utils.basemodel import ManagerAccessMixin as access
+
     interactive = get_param_from_ctx(ctx, "interactive")
 
     # Handle if already parsed (as when using network-option)
@@ -35,12 +41,12 @@ def parse_network(ctx: Context) -> Optional[ProviderContextManager]:
 
     elif provider not in (None, _NONE_NETWORK) and isinstance(provider, str):
         # Is using a choice-str network param value instead of the network object instances.
-        return ManagerAccessMixin.network_manager.parse_network_choice(
+        return access.network_manager.parse_network_choice(
             provider, disconnect_on_exit=not interactive
         )
 
     elif provider is None:
-        ecosystem = ManagerAccessMixin.network_manager.default_ecosystem
+        ecosystem = access.network_manager.default_ecosystem
         network = ecosystem.default_network
         if provider_name := network.default_provider_name:
             return network.use_provider(provider_name, disconnect_on_exit=not interactive)
@@ -64,9 +70,9 @@ class ConnectedProviderCommand(click.Command):
         self._network_callback = kwargs.pop("network_callback", None)
         super().__init__(*args, **kwargs)
 
-    def parse_args(self, ctx: Context, args: list[str]) -> list[str]:
+    def parse_args(self, ctx: "Context", args: list[str]) -> list[str]:
         arguments = args  # Renamed for better pdb support.
-        base_type = ProviderAPI if self._use_cls_types else str
+        base_type: Optional[type] = None if self._use_cls_types else str
         if existing_option := next(
             iter(
                 x
@@ -77,19 +83,26 @@ class ConnectedProviderCommand(click.Command):
             ),
             None,
         ):
+            if base_type is None:
+                from ape.api.providers import ProviderAPI
+
+                base_type = ProviderAPI
+
             # Checking instance above, not sure why mypy still mad.
             existing_option.type.base_type = base_type  # type: ignore
 
         else:
             # Add the option automatically.
+            # NOTE: Local import here only avoids circular import issues.
             from ape.cli.options import NetworkOption
 
+            # NOTE: None base-type will default to `ProviderAPI`.
             option = NetworkOption(base_type=base_type, callback=self._network_callback)
             self.params.append(option)
 
         return super().parse_args(ctx, arguments)
 
-    def invoke(self, ctx: Context) -> Any:
+    def invoke(self, ctx: "Context") -> Any:
         if self.callback is None:
             return
 
@@ -99,7 +112,7 @@ class ConnectedProviderCommand(click.Command):
         else:
             return self._invoke(ctx)
 
-    def _invoke(self, ctx: Context, provider: Optional[ProviderAPI] = None):
+    def _invoke(self, ctx: "Context", provider: Optional["ProviderAPI"] = None):
         # Will be put back with correct value if needed.
         # Else, causes issues.
         ctx.params.pop("network", None)

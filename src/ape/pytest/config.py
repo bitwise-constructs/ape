@@ -1,13 +1,18 @@
 from functools import cached_property
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
-from _pytest.config import Config as PytestConfig
-
-from ape.types import ContractFunctionPath
 from ape.utils.basemodel import ManagerAccessMixin
 
+if TYPE_CHECKING:
+    from _pytest.config import Config as PytestConfig
 
-def _get_config_exclusions(config) -> list[ContractFunctionPath]:
+    from ape.pytest.utils import Scope
+    from ape.types.trace import ContractFunctionPath
+
+
+def _get_config_exclusions(config) -> list["ContractFunctionPath"]:
+    from ape.types.trace import ContractFunctionPath
+
     return [
         ContractFunctionPath(contract_name=x.contract_name, method_name=x.method_name)
         for x in config.exclude
@@ -17,12 +22,24 @@ def _get_config_exclusions(config) -> list[ContractFunctionPath]:
 class ConfigWrapper(ManagerAccessMixin):
     """
     A class aggregating settings choices from both the pytest command line
-    as well as the ``ape-config.yaml`` file. Also serves as a wrapper around the
+    and the ``ape-config.yaml`` file. Also serves as a wrapper around the
     Pytest config object for ease-of-use and code-sharing.
     """
 
-    def __init__(self, pytest_config: PytestConfig):
+    def __init__(self, pytest_config: "PytestConfig"):
         self.pytest_config = pytest_config
+        if not self.verbosity:
+            # Enable verbose output if stdout capture is disabled
+            self.verbosity = self.pytest_config.getoption("capture") == "no"
+        # else: user has already changes verbosity to an equal or higher level; avoid downgrading.
+
+    @property
+    def verbosity(self) -> int:
+        return self.pytest_config.option.verbose
+
+    @verbosity.setter
+    def verbosity(self, value):
+        self.pytest_config.option.verbose = value
 
     @cached_property
     def supports_tracing(self) -> bool:
@@ -70,13 +87,19 @@ class ConfigWrapper(ManagerAccessMixin):
 
     @cached_property
     def show_internal(self) -> bool:
-        return self.pytest_config.getoption("--show-internal")
+        return self.pytest_config.getoption("--show-internal") or self.ape_test_config.show_internal
 
     @cached_property
-    def gas_exclusions(self) -> list[ContractFunctionPath]:
+    def enable_fixture_rebasing(self) -> bool:
+        return self.ape_test_config.enable_fixture_rebasing
+
+    @cached_property
+    def gas_exclusions(self) -> list["ContractFunctionPath"]:
         """
         The combination of both CLI values and config values.
         """
+        from ape.types.trace import ContractFunctionPath
+
         cli_value = self.pytest_config.getoption("--gas-exclude")
         exclusions = (
             [ContractFunctionPath.from_str(item) for item in cli_value.split(",")]
@@ -88,7 +111,7 @@ class ConfigWrapper(ManagerAccessMixin):
         return exclusions
 
     @cached_property
-    def coverage_exclusions(self) -> list[ContractFunctionPath]:
+    def coverage_exclusions(self) -> list["ContractFunctionPath"]:
         return _get_config_exclusions(self.ape_test_config.coverage)
 
     def get_pytest_plugin(self, name: str) -> Optional[Any]:
@@ -96,3 +119,11 @@ class ConfigWrapper(ManagerAccessMixin):
             return self.pytest_config.pluginmanager.get_plugin(name)
 
         return None
+
+    def get_isolation(self, scope: "Scope"):
+        if self.pytest_config.getoption("disable_isolation"):
+            # Was disabled via command-line.
+            return False
+
+        # Check Ape's config.
+        return self.ape_test_config.get_isolation(scope)

@@ -9,12 +9,13 @@ from ethpm_types import ContractType, ErrorABI
 from ethpm_types.abi import ABIType, EventABI, MethodABI
 from evm_trace import CallTreeNode, CallType
 
-from ape.api.networks import LOCAL_NETWORK_NAME, ForkedNetworkAPI, NetworkAPI
+from ape.api.networks import ForkedNetworkAPI, NetworkAPI
 from ape.exceptions import CustomError, DecodingError, NetworkError, NetworkNotFoundError
-from ape.types import AddressType, CurrencyValueComparable
-from ape.utils import DEFAULT_LOCAL_TRANSACTION_ACCEPTANCE_TIMEOUT
-from ape_ethereum import TransactionTrace
+from ape.types.address import AddressType
+from ape.types.units import CurrencyValueComparable
+from ape.utils.misc import DEFAULT_LOCAL_TRANSACTION_ACCEPTANCE_TIMEOUT, LOCAL_NETWORK_NAME
 from ape_ethereum.ecosystem import BLUEPRINT_HEADER, BaseEthereumConfig, Block, Ethereum
+from ape_ethereum.trace import TransactionTrace
 from ape_ethereum.transactions import (
     DynamicFeeTransaction,
     Receipt,
@@ -629,6 +630,45 @@ def test_decode_receipt_shared_blob(ethereum, blob_gas_used, blob_gas_key):
         # when None, should also default to 0.
         assert actual.blob_gas_used == 0
 
+    # Show type=3 is required.
+    data["type"] = 2
+    actual = ethereum.decode_receipt(data)
+    assert not isinstance(actual, SharedBlobReceipt)
+    assert isinstance(actual, Receipt)
+
+
+def test_decode_receipt_misleading_blob_receipt(ethereum):
+    """
+    Tests a strange situation (noticed on Tenderly nodes) where _some_
+    of the keys indicate blob-related fields, set to ``0``, and others
+    are missing, because it's not actually a blob receipt. In this case,
+    don't use the blob-receipt class.
+    """
+    data = {
+        "type": 2,
+        "status": 1,
+        "cumulativeGasUsed": 10565720,
+        "logsBloom": HexBytes(
+            "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"  # noqa: E501
+        ),
+        "logs": [],
+        "transactionHash": HexBytes(
+            "0x62fc9991bc7fb0c76bc83faaa8d1c17fc5efb050542e58ac358932f80aa7a087"
+        ),
+        "from": "0x1f9090aaE28b8a3dCeaDf281B0F12828e676c326",
+        "to": "0xeBec795c9c8bBD61FFc14A6662944748F299cAcf",
+        "contractAddress": None,
+        "gasUsed": 21055,
+        "effectiveGasPrice": 7267406643,
+        "blockHash": HexBytes("0xa47fc133f829183b751488c1146f1085451bcccd247db42066dc6c89eaf5ebac"),
+        "blockNumber": 21051245,
+        "transactionIndex": 130,
+        "blobGasUsed": 0,
+    }
+    actual = ethereum.decode_receipt(data)
+    assert not isinstance(actual, SharedBlobReceipt)
+    assert isinstance(actual, Receipt)
+
 
 def test_default_transaction_type_not_connected_used_default_network(project, ethereum, networks):
     value = TransactionType.STATIC.value
@@ -944,8 +984,9 @@ def test_networks_when_custom_ecosystem(
 
 def test_networks_multiple_networks_with_same_name(custom_networks_config_dict, ethereum, project):
     data = copy.deepcopy(custom_networks_config_dict)
-    data["networks"]["custom"][0]["name"] = "mainnet"  # There already is a mainnet in "ethereum".
-    expected = ".*More than one network named 'mainnet' in ecosystem 'ethereum'.*"
+    data["networks"]["custom"][0]["name"] = "foonet"
+    data["networks"]["custom"][1]["name"] = "foonet"
+    expected = ".*More than one network named 'foonet' in ecosystem 'ethereum'.*"
     with project.temp_config(**data):
         with pytest.raises(NetworkError, match=expected):
             _ = ethereum.networks
@@ -1045,7 +1086,7 @@ def test_decode_custom_error(chain, ethereum):
     addr = cast(AddressType, "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD")
 
     # Hack in contract-type.
-    chain.contracts._local_contract_types[addr] = contract_type
+    chain.contracts[addr] = contract_type
 
     actual = ethereum.decode_custom_error(data, addr)
     assert isinstance(actual, CustomError)
@@ -1074,7 +1115,7 @@ def test_decode_custom_error_selector_not_found(chain, ethereum):
     addr = cast(AddressType, "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD")
 
     # Hack in contract-type.
-    chain.contracts._local_contract_types[addr] = contract_type
+    chain.contracts.contract_types[addr] = contract_type
 
     tx = ethereum.create_transaction()
     actual = ethereum.decode_custom_error(data, addr, txn=tx)
@@ -1162,3 +1203,9 @@ def test_enrich_trace_handles_events(ethereum, vyper_contract_instance, owner):
         }
     ]
     assert events == expected
+
+
+def test_get_deployment_address(ethereum, owner, vyper_contract_container):
+    actual = ethereum.get_deployment_address(owner.address, owner.nonce)
+    expected = owner.deploy(vyper_contract_container, 490)
+    assert actual == expected

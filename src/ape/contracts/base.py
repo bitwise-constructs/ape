@@ -1,21 +1,17 @@
 import difflib
 import types
 from collections.abc import Callable, Iterator
-from functools import partial
+from functools import cached_property, partial, singledispatchmethod
 from itertools import islice
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import click
-import pandas as pd
 from eth_pydantic_types import HexBytes
 from eth_utils import to_hex
-from ethpm_types.abi import ConstructorABI, ErrorABI, EventABI, MethodABI
-from ethpm_types.contract_type import ABI_W_SELECTOR_T, ContractType
-from IPython.lib.pretty import for_type
+from ethpm_types.abi import EventABI
 
-from ape.api import AccountAPI, Address, ReceiptAPI, TransactionAPI
-from ape.api.address import BaseAddress
+from ape.api.address import Address, BaseAddress
 from ape.api.query import (
     ContractCreation,
     ContractEventQuery,
@@ -34,29 +30,33 @@ from ape.exceptions import (
     MissingDeploymentBytecodeError,
 )
 from ape.logging import get_rich_console, logger
-from ape.types import AddressType, ContractLog, LogFilter, MockContractLog
-from ape.utils import (
-    BaseInterfaceModel,
-    ManagerAccessMixin,
-    cached_property,
-    log_instead_of_fail,
-    singledispatchmethod,
-)
+from ape.types.events import ContractLog, LogFilter, MockContractLog
 from ape.utils.abi import StructParser, _enrich_natspec
 from ape.utils.basemodel import (
+    BaseInterfaceModel,
     ExtraAttributesMixin,
     ExtraModelAttributes,
+    ManagerAccessMixin,
     _assert_not_ipython_check,
     get_attribute_with_extras,
     only_raise_attribute_error,
 )
+from ape.utils.misc import log_instead_of_fail
+
+if TYPE_CHECKING:
+    from ethpm_types.abi import ConstructorABI, ErrorABI, MethodABI
+    from ethpm_types.contract_type import ABI_W_SELECTOR_T, ContractType
+    from pandas import DataFrame
+
+    from ape.api.transactions import ReceiptAPI, TransactionAPI
+    from ape.types.address import AddressType
 
 
 class ContractConstructor(ManagerAccessMixin):
     def __init__(
         self,
         deployment_bytecode: HexBytes,
-        abi: ConstructorABI,
+        abi: "ConstructorABI",
     ) -> None:
         self.deployment_bytecode = deployment_bytecode
         self.abi = abi
@@ -78,17 +78,17 @@ class ContractConstructor(ManagerAccessMixin):
         decoded_inputs = self.provider.network.ecosystem.decode_calldata(self.abi, calldata)
         return self.abi.selector, decoded_inputs
 
-    def serialize_transaction(self, *args, **kwargs) -> TransactionAPI:
+    def serialize_transaction(self, *args, **kwargs) -> "TransactionAPI":
         arguments = self.conversion_manager.convert_method_args(self.abi, args)
         converted_kwargs = self.conversion_manager.convert_method_kwargs(kwargs)
         return self.provider.network.ecosystem.encode_deployment(
             self.deployment_bytecode, self.abi, *arguments, **converted_kwargs
         )
 
-    def __call__(self, private: bool = False, *args, **kwargs) -> ReceiptAPI:
+    def __call__(self, private: bool = False, *args, **kwargs) -> "ReceiptAPI":
         txn = self.serialize_transaction(*args, **kwargs)
 
-        if "sender" in kwargs and isinstance(kwargs["sender"], AccountAPI):
+        if "sender" in kwargs and hasattr(kwargs["sender"], "call"):
             sender = kwargs["sender"]
             return sender.call(txn, **kwargs)
         elif "sender" not in kwargs and self.account_manager.default_sender is not None:
@@ -102,7 +102,7 @@ class ContractConstructor(ManagerAccessMixin):
 
 
 class ContractCall(ManagerAccessMixin):
-    def __init__(self, abi: MethodABI, address: AddressType) -> None:
+    def __init__(self, abi: "MethodABI", address: "AddressType") -> None:
         super().__init__()
         self.abi = abi
         self.address = address
@@ -111,7 +111,7 @@ class ContractCall(ManagerAccessMixin):
     def __repr__(self) -> str:
         return self.abi.signature
 
-    def serialize_transaction(self, *args, **kwargs) -> TransactionAPI:
+    def serialize_transaction(self, *args, **kwargs) -> "TransactionAPI":
         converted_kwargs = self.conversion_manager.convert_method_kwargs(kwargs)
         return self.provider.network.ecosystem.encode_transaction(
             self.address, self.abi, *args, **converted_kwargs
@@ -138,9 +138,9 @@ class ContractCall(ManagerAccessMixin):
 
 class ContractMethodHandler(ManagerAccessMixin):
     contract: "ContractInstance"
-    abis: list[MethodABI]
+    abis: list["MethodABI"]
 
-    def __init__(self, contract: "ContractInstance", abis: list[MethodABI]) -> None:
+    def __init__(self, contract: "ContractInstance", abis: list["MethodABI"]) -> None:
         super().__init__()
         self.contract = contract
         self.abis = abis
@@ -318,7 +318,7 @@ class ContractCallHandler(ContractMethodHandler):
         return self.transact.estimate_gas_cost(*arguments, **kwargs)
 
 
-def _select_method_abi(abis: list[MethodABI], args: Union[tuple, list]) -> MethodABI:
+def _select_method_abi(abis: list["MethodABI"], args: Union[tuple, list]) -> "MethodABI":
     args = args or []
     selected_abi = None
     for abi in abis:
@@ -333,19 +333,16 @@ def _select_method_abi(abis: list[MethodABI], args: Union[tuple, list]) -> Metho
 
 
 class ContractTransaction(ManagerAccessMixin):
-    abi: MethodABI
-    address: AddressType
-
-    def __init__(self, abi: MethodABI, address: AddressType) -> None:
+    def __init__(self, abi: "MethodABI", address: "AddressType") -> None:
         super().__init__()
-        self.abi = abi
-        self.address = address
+        self.abi: "MethodABI" = abi
+        self.address: "AddressType" = address
 
     @log_instead_of_fail(default="<ContractTransaction>")
     def __repr__(self) -> str:
         return self.abi.signature
 
-    def serialize_transaction(self, *args, **kwargs) -> TransactionAPI:
+    def serialize_transaction(self, *args, **kwargs) -> "TransactionAPI":
         if "sender" in kwargs and isinstance(kwargs["sender"], (ContractInstance, Address)):
             # Automatically impersonate contracts (if API available) when sender
             kwargs["sender"] = self.account_manager.test_accounts[kwargs["sender"].address]
@@ -356,11 +353,11 @@ class ContractTransaction(ManagerAccessMixin):
             self.address, self.abi, *arguments, **converted_kwargs
         )
 
-    def __call__(self, *args, **kwargs) -> ReceiptAPI:
+    def __call__(self, *args, **kwargs) -> "ReceiptAPI":
         txn = self.serialize_transaction(*args, **kwargs)
         private = kwargs.get("private", False)
 
-        if "sender" in kwargs and isinstance(kwargs["sender"], AccountAPI):
+        if "sender" in kwargs and hasattr(kwargs["sender"], "call"):
             return kwargs["sender"].call(txn, **kwargs)
 
         txn = self.provider.prepare_transaction(txn)
@@ -372,7 +369,7 @@ class ContractTransaction(ManagerAccessMixin):
 
 
 class ContractTransactionHandler(ContractMethodHandler):
-    def as_transaction(self, *args, **kwargs) -> TransactionAPI:
+    def as_transaction(self, *args, **kwargs) -> "TransactionAPI":
         """
         Get a :class:`~ape.api.transactions.TransactionAPI`
         for this contract method invocation. This is useful
@@ -423,7 +420,7 @@ class ContractTransactionHandler(ContractMethodHandler):
 
         return ContractCallHandler(self.contract, self.abis)
 
-    def __call__(self, *args, **kwargs) -> ReceiptAPI:
+    def __call__(self, *args, **kwargs) -> "ReceiptAPI":
         contract_transaction = self._as_transaction(*args)
         if "sender" not in kwargs and self.account_manager.default_sender is not None:
             kwargs["sender"] = self.account_manager.default_sender
@@ -439,6 +436,7 @@ class ContractTransactionHandler(ContractMethodHandler):
         )
 
 
+# TODO: In Ape 0.9 - make not a BaseModel - no reason to.
 class ContractEvent(BaseInterfaceModel):
     """
     The types of events on a :class:`~ape.contracts.base.ContractInstance`.
@@ -552,6 +550,16 @@ class ContractEvent(BaseInterfaceModel):
         return sum(1 for _ in logs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> MockContractLog:
+        """
+        Create a mock-instance of a log using this event ABI and the contract address.
+
+        Args:
+            *args: Positional arguments for the event.
+            **kwargs: Key-word arguments for the event.
+
+        Returns:
+            :class:`~ape.types.events.MockContractLog`
+        """
         # Create a dictionary from the positional arguments
         event_args: dict[Any, Any] = dict(zip((ipt.name for ipt in self.abi.inputs), args))
         if overlapping_keys := set(event_args).intersection(kwargs):
@@ -614,7 +622,7 @@ class ContractEvent(BaseInterfaceModel):
         stop_block: Optional[int] = None,
         step: int = 1,
         engine_to_use: Optional[str] = None,
-    ) -> pd.DataFrame:
+    ) -> "DataFrame":
         """
         Iterate through blocks for log events
 
@@ -633,23 +641,25 @@ class ContractEvent(BaseInterfaceModel):
         Returns:
             pd.DataFrame
         """
+        # perf: pandas import is really slow. Avoid importing at module level.
+        import pandas as pd
 
+        HEAD = self.chain_manager.blocks.height
         if start_block < 0:
-            start_block = self.chain_manager.blocks.height + start_block
+            start_block = HEAD + start_block
 
         if stop_block is None:
-            stop_block = self.chain_manager.blocks.height
+            stop_block = HEAD
 
         elif stop_block < 0:
-            stop_block = self.chain_manager.blocks.height + stop_block
+            stop_block = HEAD + stop_block
 
-        elif stop_block > self.chain_manager.blocks.height:
+        elif stop_block > HEAD:
             raise ChainError(
-                f"'stop={stop_block}' cannot be greater than "
-                f"the chain length ({self.chain_manager.blocks.height})."
+                f"'stop={stop_block}' cannot be greater than the chain length ({HEAD})."
             )
         query: dict = {
-            "columns": list(ContractLog.model_fields) if columns[0] == "*" else columns,
+            "columns": list(ContractLog.__pydantic_fields__) if columns[0] == "*" else columns,
             "event": self.abi,
             "start_block": start_block,
             "stop_block": stop_block,
@@ -692,12 +702,12 @@ class ContractEvent(BaseInterfaceModel):
         Returns:
             Iterator[:class:`~ape.contracts.base.ContractLog`]
         """
-
         if not (contract_address := getattr(self.contract, "address", None)):
             return
 
         start_block = None
         stop_block = None
+        HEAD = self.chain_manager.blocks.height  # Current block height
 
         if stop is None:
             contract = None
@@ -706,30 +716,60 @@ class ContractEvent(BaseInterfaceModel):
             except Exception:
                 pass
 
-            if contract:
-                if creation := contract.creation_metadata:
-                    start_block = creation.block
+            # Determine the start block from contract creation metadata
+            if contract and (creation := contract.creation_metadata):
+                start_block = creation.block
 
-            stop_block = start_or_stop
+            # Handle single parameter usage (like Python's range(stop))
+            if start_or_stop == 0:
+                # stop==0 is the same as stop==HEAD
+                # because of the -1 (turns to negative).
+                stop_block = HEAD + 1
+            elif start_or_stop >= 0:
+                # Given like range(1)
+                stop_block = min(start_or_stop - 1, HEAD)
+            else:
+                # Give like range(-1)
+                stop_block = HEAD + start_or_stop
 
         elif start_or_stop is not None and stop is not None:
-            start_block = start_or_stop
-            stop_block = stop - 1
+            # Handle cases where both start and stop are provided
+            if start_or_stop >= 0:
+                start_block = min(start_or_stop, HEAD)
+            else:
+                # Negative start relative to HEAD
+                adjusted_value = HEAD + start_or_stop + 1
+                start_block = max(adjusted_value, 0)
 
-        stop_block = min(stop_block, self.chain_manager.blocks.height)
+            if stop == 0:
+                # stop==0 is the same as stop==HEAD
+                # because of the -1 (turns to negative).
+                stop_block = HEAD
+            elif stop > 0:
+                # Positive stop, capped to the chain HEAD
+                stop_block = min(stop - 1, HEAD)
+            else:
+                # Negative stop.
+                adjusted_value = HEAD + stop
+                stop_block = max(adjusted_value, 0)
 
+        # Gather all addresses to query (contract and any extra ones provided)
         addresses = list(set([contract_address] + (extra_addresses or [])))
+
+        # Construct the event query
         contract_event_query = ContractEventQuery(
-            columns=list(ContractLog.model_fields.keys()),
+            columns=list(ContractLog.__pydantic_fields__),  # Ensure all necessary columns
             contract=addresses,
             event=self.abi,
             search_topics=search_topics,
-            start_block=start_block or 0,
-            stop_block=stop_block,
+            start_block=start_block or 0,  # Default to block 0 if not set
+            stop_block=stop_block,  # None means query to the current HEAD
         )
+
+        # Execute the query and yield results
         yield from self.query_manager.query(contract_event_query)  # type: ignore
 
-    def from_receipt(self, receipt: ReceiptAPI) -> list[ContractLog]:
+    def from_receipt(self, receipt: "ReceiptAPI") -> list[ContractLog]:
         """
         Get all the events from the given receipt.
 
@@ -797,8 +837,43 @@ class ContractEvent(BaseInterfaceModel):
             )
 
 
+# TODO: In 0.9, just make `_events_` or ContractEvent possibly handle multiple ABIs
+#   much like the transactions handlers do. OR at least take the opportunity to refactor.
+class ContractEventWrapper:
+    """
+    A wrapper used when multiple events have the same so that
+    you can still create mock-logs.
+    """
+
+    def __init__(self, events: list[ContractEvent]):
+        self.events = events
+
+    def __call__(self, *args, **kwargs) -> MockContractLog:
+        """
+        Create a mock contract log using the first working ABI.
+
+        Args:
+            *args: Positional arguments for the event.
+            **kwargs: Key-word arguments for the event.
+
+        Returns:
+            :class:`~ape.types.events.MockContractLog`
+        """
+        # TODO: Use composite error.
+        errors = []
+        for evt in self.events:
+            try:
+                return evt(*args, **kwargs)
+            except ValueError as err:
+                errors.append(err)
+                continue  # not a match
+
+        error_str = ", ".join([f"{e}" for e in errors])
+        raise ValueError(f"Could not make a mock contract log. Errors: {error_str}")
+
+
 class ContractTypeWrapper(ManagerAccessMixin):
-    contract_type: ContractType
+    contract_type: "ContractType"
     base_path: Optional[Path] = None
 
     @property
@@ -810,7 +885,7 @@ class ContractTypeWrapper(ManagerAccessMixin):
         return self.contract_type.selector_identifiers
 
     @property
-    def identifier_lookup(self) -> dict[str, ABI_W_SELECTOR_T]:
+    def identifier_lookup(self) -> dict[str, "ABI_W_SELECTOR_T"]:
         """
         Provides a mapping of method, error, and event selector identifiers to
         ABI Types.
@@ -866,7 +941,7 @@ class ContractTypeWrapper(ManagerAccessMixin):
         input_dict = ecosystem.decode_calldata(method, rest_calldata)
         return method.selector, input_dict
 
-    def _create_custom_error_type(self, abi: ErrorABI, **kwargs) -> type[CustomError]:
+    def _create_custom_error_type(self, abi: "ErrorABI", **kwargs) -> type[CustomError]:
         def exec_body(namespace):
             namespace["abi"] = abi
             namespace["contract"] = self
@@ -896,6 +971,9 @@ class ContractTypeWrapper(ManagerAccessMixin):
         info = _get_info()
         error_type.info = error_type.__doc__ = info  # type: ignore
         if info:
+            # perf: Avoid forcing everyone to import from IPython.
+            from IPython.lib.pretty import for_type
+
             error_type._repr_pretty_ = repr_pretty_for_assignment  # type: ignore
 
             # Register the dynamically-created type with IPython so it integrates.
@@ -920,8 +998,8 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
     def __init__(
         self,
-        address: AddressType,
-        contract_type: ContractType,
+        address: "AddressType",
+        contract_type: "ContractType",
         txn_hash: Optional[Union[str, HexBytes]] = None,
     ) -> None:
         super().__init__()
@@ -931,7 +1009,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
             (txn_hash if isinstance(txn_hash, str) else to_hex(txn_hash)) if txn_hash else None
         )
 
-    def __call__(self, *args, **kwargs) -> ReceiptAPI:
+    def __call__(self, *args, **kwargs) -> "ReceiptAPI":
         has_value = kwargs.get("value")
         has_data = kwargs.get("data") or kwargs.get("input")
         has_non_payable_fallback = (
@@ -955,7 +1033,9 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
         return super().__call__(*args, **kwargs)
 
     @classmethod
-    def from_receipt(cls, receipt: ReceiptAPI, contract_type: ContractType) -> "ContractInstance":
+    def from_receipt(
+        cls, receipt: "ReceiptAPI", contract_type: "ContractType"
+    ) -> "ContractInstance":
         """
         Create a contract instance from the contract deployment receipt.
         """
@@ -974,7 +1054,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
         # Cache creation.
         creation = ContractCreation.from_receipt(receipt)
-        cls.chain_manager.contracts._local_contract_creation[address] = creation
+        cls.chain_manager.contracts.contract_creations[address] = creation
 
         return instance
 
@@ -995,7 +1075,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
         return f"<{contract_name} {self.address}>"
 
     @property
-    def address(self) -> AddressType:
+    def address(self) -> "AddressType":
         """
         The address of the contract.
 
@@ -1007,7 +1087,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
     @cached_property
     def _view_methods_(self) -> dict[str, ContractCallHandler]:
-        view_methods: dict[str, list[MethodABI]] = dict()
+        view_methods: dict[str, list["MethodABI"]] = dict()
 
         for abi in self.contract_type.view_methods:
             if abi.name in view_methods:
@@ -1026,7 +1106,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
     @cached_property
     def _mutable_methods_(self) -> dict[str, ContractTransactionHandler]:
-        mutable_methods: dict[str, list[MethodABI]] = dict()
+        mutable_methods: dict[str, list["MethodABI"]] = dict()
 
         for abi in self.contract_type.mutable_methods:
             if abi.name in mutable_methods:
@@ -1073,10 +1153,10 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
         else:
             # Didn't find anything that matches
-            name = self.contract_type.name or ContractType.__name__
+            name = self.contract_type.name or "ContractType"
             raise ApeAttributeError(f"'{name}' has no attribute '{method_name}'.")
 
-    def invoke_transaction(self, method_name: str, *args, **kwargs) -> ReceiptAPI:
+    def invoke_transaction(self, method_name: str, *args, **kwargs) -> "ReceiptAPI":
         """
         Call a contract's function directly using the method_name.
         This function is for non-view function's which may change
@@ -1108,7 +1188,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
         else:
             # Didn't find anything that matches
-            name = self.contract_type.name or ContractType.__name__
+            name = self.contract_type.name or "ContractType"
             raise ApeAttributeError(f"'{name}' has no attribute '{method_name}'.")
 
     def get_event_by_signature(self, signature: str) -> ContractEvent:
@@ -1166,7 +1246,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
     @cached_property
     def _events_(self) -> dict[str, list[ContractEvent]]:
-        events: dict[str, list[EventABI]] = {}
+        events: dict[str, list["EventABI"]] = {}
 
         for abi in self.contract_type.events:
             if abi.name in events:
@@ -1185,7 +1265,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
 
     @cached_property
     def _errors_(self) -> dict[str, list[type[CustomError]]]:
-        abis: dict[str, list[ErrorABI]] = {}
+        abis: dict[str, list["ErrorABI"]] = {}
 
         try:
             for abi in self.contract_type.errors:
@@ -1301,10 +1381,7 @@ class ContractInstance(BaseAddress, ContractTypeWrapper):
         elif attr_name in self._events_:
             evt_options = self._events_[attr_name]
             if len(evt_options) > 1:
-                raise ApeAttributeError(
-                    f"Multiple events named '{attr_name}' in '{self.contract_type.name}'.\n"
-                    f"Use '{self.get_event_by_signature.__name__}' look-up."
-                )
+                return ContractEventWrapper(evt_options)
 
             return evt_options[0]
 
@@ -1337,7 +1414,7 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
         contract_container = project.MyContract  # Assuming there is a contract named "MyContract"
     """
 
-    def __init__(self, contract_type: ContractType) -> None:
+    def __init__(self, contract_type: "ContractType") -> None:
         self.contract_type = contract_type
 
     @log_instead_of_fail(default="<ContractContainer>")
@@ -1402,7 +1479,10 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
         return self.chain_manager.contracts.get_deployments(self)
 
     def at(
-        self, address: AddressType, txn_hash: Optional[Union[str, HexBytes]] = None
+        self,
+        address: "AddressType",
+        txn_hash: Optional[Union[str, HexBytes]] = None,
+        fetch_from_explorer: bool = True,
     ) -> ContractInstance:
         """
         Get a contract at the given address.
@@ -1420,13 +1500,16 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
               a different ABI than :attr:`~ape.contracts.ContractContainer.contract_type`.
             txn_hash (Union[str, HexBytes]): The hash of the transaction that deployed the
               contract, if available. Defaults to ``None``.
+            fetch_from_explorer (bool): Set to ``False`` to avoid fetching from an explorer.
 
         Returns:
             :class:`~ape.contracts.ContractInstance`
         """
-
         return self.chain_manager.contracts.instance_at(
-            address, self.contract_type, txn_hash=txn_hash
+            address,
+            self.contract_type,
+            txn_hash=txn_hash,
+            fetch_from_explorer=fetch_from_explorer,
         )
 
     @cached_property
@@ -1436,7 +1519,7 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
             deployment_bytecode=self.contract_type.get_deployment_bytecode() or HexBytes(""),
         )
 
-    def __call__(self, *args, **kwargs) -> TransactionAPI:
+    def __call__(self, *args, **kwargs) -> "TransactionAPI":
         args_length = len(args)
         inputs_length = (
             len(self.constructor.abi.inputs)
@@ -1471,7 +1554,7 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
         if kwargs.get("value") and not self.contract_type.constructor.is_payable:
             raise MethodNonPayableError("Sending funds to a non-payable constructor.")
 
-        if "sender" in kwargs and isinstance(kwargs["sender"], AccountAPI):
+        if "sender" in kwargs and hasattr(kwargs["sender"], "call"):
             # Handle account-related preparation if needed, such as signing
             receipt = self._cache_wrap(lambda: kwargs["sender"].call(txn, **kwargs))
 
@@ -1502,7 +1585,7 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
         instance.base_path = self.base_path or self.local_project.contracts_folder
         return instance
 
-    def _cache_wrap(self, function: Callable) -> ReceiptAPI:
+    def _cache_wrap(self, function: Callable) -> "ReceiptAPI":
         """
         A helper method to ensure a contract type is cached as early on
         as possible to help enrich errors from ``deploy()`` transactions
@@ -1527,11 +1610,11 @@ class ContractContainer(ContractTypeWrapper, ExtraAttributesMixin):
 
             raise  # The error after caching.
 
-    def declare(self, *args, **kwargs) -> ReceiptAPI:
+    def declare(self, *args, **kwargs) -> "ReceiptAPI":
         transaction = self.provider.network.ecosystem.encode_contract_blueprint(
             self.contract_type, *args, **kwargs
         )
-        if "sender" in kwargs and isinstance(kwargs["sender"], AccountAPI):
+        if "sender" in kwargs and hasattr(kwargs["sender"], "call"):
             return kwargs["sender"].call(transaction)
 
         receipt = self.provider.send_transaction(transaction)

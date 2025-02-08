@@ -3,7 +3,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from shutil import copytree
-from typing import Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 import pytest
 from eth_pydantic_types import HexBytes
@@ -12,14 +12,18 @@ from ethpm_types import ContractType, ErrorABI, MethodABI
 from ethpm_types.abi import ABIType
 
 import ape
-from ape.api.networks import LOCAL_NETWORK_NAME
 from ape.contracts import ContractContainer, ContractInstance
 from ape.contracts.base import ContractCallHandler
 from ape.exceptions import ChainError, ContractLogicError, ProviderError
 from ape.logging import LogLevel
 from ape.logging import logger as _logger
-from ape.types import AddressType, ContractLog
+from ape.types.address import AddressType
+from ape.utils.misc import LOCAL_NETWORK_NAME
 from ape_ethereum.proxies import minimal_proxy as _minimal_proxy_container
+
+if TYPE_CHECKING:
+    from ape.types.events import ContractLog
+
 
 ALIAS_2 = "__FUNCTIONAL_TESTS_ALIAS_2__"
 TEST_ADDRESS = cast(AddressType, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
@@ -281,11 +285,9 @@ def project_with_source_files_contract(project_with_contract):
 
 
 @pytest.fixture
-def clean_contracts_cache(chain):
-    original_cached_contracts = chain.contracts._local_contract_types
-    chain.contracts._local_contract_types = {}
-    yield
-    chain.contracts._local_contract_types = original_cached_contracts
+def clean_contract_caches(chain):
+    with chain.contracts.use_temporary_caches():
+        yield
 
 
 @pytest.fixture
@@ -325,7 +327,7 @@ def mainnet_contract(chain):
             / f"{address}.json"
         )
         contract = ContractType.model_validate_json(path.read_text())
-        chain.contracts._local_contract_types[address] = contract
+        chain.contracts[address] = contract
         return contract
 
     return contract_getter
@@ -430,7 +432,7 @@ def PollDaemon():
 @pytest.fixture
 def assert_log_values(contract_instance):
     def _assert_log_values(
-        log: ContractLog,
+        log: "ContractLog",
         number: int,
         previous_number: Optional[int] = None,
         address: Optional[AddressType] = None,
@@ -448,19 +450,9 @@ def assert_log_values(contract_instance):
     return _assert_log_values
 
 
-@pytest.fixture
-def remove_disk_writes_deployments(chain):
-    if chain.contracts._deployments_mapping_cache.is_file():
-        chain.contracts._deployments_mapping_cache.unlink()
-
-    yield
-
-    if chain.contracts._deployments_mapping_cache.is_file():
-        chain.contracts._deployments_mapping_cache.unlink()
-
-
 @pytest.fixture(scope="session")
 def logger():
+    _logger.set_level(LogLevel.ERROR)
     return _logger
 
 
@@ -610,9 +602,9 @@ def struct_input_for_call(owner):
 
 
 @pytest.fixture(scope="session")
-def output_from_struct_input_call(test_accounts):
+def output_from_struct_input_call(accounts):
     # Expected when using `struct_input_for_call`.
-    addr = test_accounts[0].address.replace("0x", "")
+    addr = accounts[0].address.replace("0x", "")
     return HexBytes(
         f"0x26e0a196000000000000000000000000{addr}000000000000000000000000000000000"
         f"0000000000000000000000000000080000000000000000000000000000000000000000000"
@@ -647,6 +639,7 @@ def make_mock_compiler(mocker):
         mock.tracked_settings = []
         mock.ast = None
         mock.pcmap = None
+        mock.abi = []
 
         def mock_compile(paths, project=None, settings=None):
             settings = settings or {}
@@ -699,7 +692,7 @@ def create_mock_sepolia(ethereum, eth_tester_provider, vyper_contract_instance):
     @contextmanager
     def fn():
         # Ensuring contract exists before hack.
-        # This allow the network to be past genesis which is more realistic.
+        # This allows the network to be past genesis which is more realistic.
         _ = vyper_contract_instance
         eth_tester_provider.network.name = "sepolia"
         yield eth_tester_provider.network
@@ -789,6 +782,6 @@ def setup_custom_error(chain):
         contract_type = ContractType(abi=abi)
 
         # Hack in contract-type.
-        chain.contracts._local_contract_types[addr] = contract_type
+        chain.contracts.contract_types[addr] = contract_type
 
     return fn

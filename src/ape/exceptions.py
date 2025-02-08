@@ -8,24 +8,26 @@ from functools import cached_property
 from inspect import getframeinfo, stack
 from pathlib import Path
 from types import CodeType, TracebackType
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import click
-from eth_typing import Hash32, HexStr
-from eth_utils import humanize_hash, to_hex
-from ethpm_types import ContractType
-from ethpm_types.abi import ConstructorABI, ErrorABI, MethodABI
 from rich import print as rich_print
 
 from ape.logging import LogLevel, logger
 
 if TYPE_CHECKING:
+    from eth_typing import HexStr
+    from ethpm_types.abi import ConstructorABI, ErrorABI, MethodABI
+    from ethpm_types.contract_type import ContractType
+
     from ape.api.networks import NetworkAPI
     from ape.api.providers import SubprocessProvider
     from ape.api.trace import TraceAPI
     from ape.api.transactions import ReceiptAPI, TransactionAPI
     from ape.managers.project import ProjectManager
-    from ape.types import AddressType, BlockID, SnapshotID, SourceTraceback
+    from ape.types.address import AddressType
+    from ape.types.trace import SourceTraceback
+    from ape.types.vm import BlockID, SnapshotID
 
 
 FailedTxn = Union["TransactionAPI", "ReceiptAPI"]
@@ -87,7 +89,7 @@ class MissingDeploymentBytecodeError(ContractDataError):
     Raised when trying to deploy an interface or empty data.
     """
 
-    def __init__(self, contract_type: ContractType):
+    def __init__(self, contract_type: "ContractType"):
         message = "Cannot deploy: contract"
         if name := contract_type.name:
             message = f"{message} '{name}'"
@@ -106,7 +108,7 @@ class ArgumentsLengthError(ContractDataError):
     def __init__(
         self,
         arguments_length: int,
-        inputs: Union[MethodABI, ConstructorABI, int, list, None] = None,
+        inputs: Union["MethodABI", "ConstructorABI", int, list, None] = None,
         **kwargs,
     ):
         prefix = (
@@ -117,7 +119,7 @@ class ArgumentsLengthError(ContractDataError):
             super().__init__(f"{prefix}.")
             return
 
-        inputs_ls: list[Union[MethodABI, ConstructorABI, int]] = (
+        inputs_ls: list[Union["MethodABI", "ConstructorABI", int]] = (
             inputs if isinstance(inputs, list) else [inputs]
         )
         if not inputs_ls:
@@ -220,7 +222,7 @@ class TransactionError(ApeException):
         return receiver
 
     @cached_property
-    def contract_type(self) -> Optional[ContractType]:
+    def contract_type(self) -> Optional["ContractType"]:
         if not (address := self.address):
             # Contract address not found.
             return None
@@ -301,7 +303,7 @@ class ContractLogicError(VirtualMachineError):
         source_traceback: _SOURCE_TRACEBACK_ARG = None,
         base_err: Optional[Exception] = None,
         project: Optional["ProjectManager"] = None,
-        set_ape_traceback: bool = True,  # Overriden default.
+        set_ape_traceback: bool = True,  # Overridden default.
     ):
         self.txn = txn
         self.contract_address = contract_address
@@ -518,9 +520,11 @@ class BlockNotFoundError(ProviderError):
 
     def __init__(self, block_id: "BlockID", reason: Optional[str] = None):
         if isinstance(block_id, bytes):
-            block_id_str = to_hex(block_id)
+            block_id_str = block_id.hex()
+            if not block_id_str.startswith("0x"):
+                block_id_str = f"0x{block_id_str}"
         else:
-            block_id_str = HexStr(str(block_id))
+            block_id_str: "HexStr" = f"{block_id}"  # type: ignore
 
         message = (
             "Missing latest block."
@@ -618,11 +622,26 @@ class UnknownSnapshotError(ChainError):
     """
 
     def __init__(self, snapshot_id: "SnapshotID"):
+        snapshot_id_str: str
         if isinstance(snapshot_id, bytes):
-            # Is block hash
-            snapshot_id = humanize_hash(cast(Hash32, snapshot_id))
+            # Is block hash. Logic borrowed from `eth_utils.humanize_hash()`.
+            if len(snapshot_id) <= 5:
+                snapshot_id_str = snapshot_id.hex()
+            else:
+                value_hex = snapshot_id.hex()
+                head = value_hex[:4]
+                tail_idx = -1 * 4
+                tail = value_hex[tail_idx:]
+                snapshot_id_str = f"{head}..{tail}"
 
-        super().__init__(f"Unknown snapshot ID '{str(snapshot_id)}'.")
+            snapshot_id_str = (
+                f"0x{snapshot_id_str}" if not snapshot_id_str.startswith("0x") else snapshot_id_str
+            )
+
+        else:
+            snapshot_id_str = f"{snapshot_id}"  # type: ignore
+
+        super().__init__(f"Unknown snapshot ID '{snapshot_id_str}'.")
 
 
 class QueryEngineError(ApeException):
@@ -668,7 +687,7 @@ class SubprocessTimeoutError(SubprocessError):
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self._seconds in [None, ""]:
             return ""
 
@@ -846,7 +865,7 @@ class CustomError(ContractLogicError):
 
     def __init__(
         self,
-        abi: ErrorABI,
+        abi: "ErrorABI",
         inputs: dict[str, Any],
         txn: Optional[FailedTxn] = None,
         trace: _TRACE_ARG = None,
@@ -918,7 +937,9 @@ def _get_custom_python_traceback(
     #  https://github.com/pallets/jinja/blob/main/src/jinja2/debug.py#L142
 
     if project is None:
-        from ape import project
+        from ape.utils.basemodel import ManagerAccessMixin as access
+
+        project = access.local_project
 
     if not (base_path := getattr(project, "path", None)):
         # TODO: Add support for manifest-projects.

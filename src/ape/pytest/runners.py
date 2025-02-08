@@ -1,31 +1,37 @@
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import click
 import pytest
 from _pytest._code.code import Traceback as PytestTraceback
 from rich import print as rich_print
 
-from ape.api.networks import ProviderContextManager
+from ape.exceptions import ConfigError, ProviderNotConnectedError
 from ape.logging import LogLevel
-from ape.pytest.config import ConfigWrapper
-from ape.pytest.coverage import CoverageTracker
-from ape.pytest.fixtures import ReceiptCapture
-from ape.pytest.gas import GasTracker
-from ape.types.coverage import CoverageReport
+from ape.pytest.utils import Scope
 from ape.utils.basemodel import ManagerAccessMixin
-from ape_console._cli import console
+
+if TYPE_CHECKING:
+    from ape.api.networks import ProviderContextManager
+    from ape.pytest.config import ConfigWrapper
+    from ape.pytest.coverage import CoverageTracker
+    from ape.pytest.fixtures import FixtureManager, IsolationManager, ReceiptCapture
+    from ape.pytest.gas import GasTracker
+    from ape.types.coverage import CoverageReport
 
 
 class PytestApeRunner(ManagerAccessMixin):
     def __init__(
         self,
-        config_wrapper: ConfigWrapper,
-        receipt_capture: ReceiptCapture,
-        gas_tracker: GasTracker,
-        coverage_tracker: CoverageTracker,
+        config_wrapper: "ConfigWrapper",
+        isolation_manager: "IsolationManager",
+        receipt_capture: "ReceiptCapture",
+        gas_tracker: "GasTracker",
+        coverage_tracker: "CoverageTracker",
+        fixture_manager: Optional["FixtureManager"] = None,
     ):
         self.config_wrapper = config_wrapper
+        self.isolation_manager = isolation_manager
         self.receipt_capture = receipt_capture
         self._provider_is_connected = False
 
@@ -34,12 +40,23 @@ class PytestApeRunner(ManagerAccessMixin):
         self.gas_tracker = gas_tracker
         self.coverage_tracker = coverage_tracker
 
+        if fixture_manager is None:
+            from ape.pytest.fixtures import FixtureManager
+
+            self.fixture_manager = FixtureManager(config_wrapper, isolation_manager)
+
+        else:
+            self.fixture_manager = fixture_manager
+
+        self._initialized_fixtures: list[str] = []
+        self._finalized_fixtures: list[str] = []
+
     @property
-    def _provider_context(self) -> ProviderContextManager:
+    def _provider_context(self) -> "ProviderContextManager":
         return self.network_manager.parse_network_choice(self.config_wrapper.network)
 
     @property
-    def _coverage_report(self) -> Optional[CoverageReport]:
+    def _coverage_report(self) -> Optional["CoverageReport"]:
         return self.coverage_tracker.data.report if self.coverage_tracker.data else None
 
     def pytest_exception_interact(self, report, call):
@@ -69,17 +86,26 @@ class PytestApeRunner(ManagerAccessMixin):
             # Else, it gets way too noisy.
             show_locals = not self.config_wrapper.show_internal
 
-            report.longrepr = call.excinfo.getrepr(
-                funcargs=True,
-                abspath=Path.cwd(),
-                showlocals=show_locals,
-                style="short",
-                tbfilter=False,
-                truncate_locals=True,
-                chain=False,
-            )
+            try:
+                here = Path.cwd()
+
+            except FileNotFoundError:
+                pass  # In a temp-folder, most likely.
+
+            else:
+                report.longrepr = call.excinfo.getrepr(
+                    funcargs=True,
+                    abspath=here,
+                    showlocals=show_locals,
+                    style="short",
+                    tbfilter=False,
+                    truncate_locals=True,
+                    chain=False,
+                )
 
         if self.config_wrapper.interactive and report.failed:
+            from ape_console._cli import console
+
             traceback = call.excinfo.traceback[-1]
 
             # Suspend capsys to ignore our own output.
@@ -114,6 +140,7 @@ class PytestApeRunner(ManagerAccessMixin):
             click.echo("Starting interactive mode. Type `exit` to halt current test.")
 
             namespace = {"_callinfo": call, **globals_dict, **locals_dict}
+
             console(extra_locals=namespace, project=self.local_project, embed=True)
 
             if capman:
@@ -132,39 +159,56 @@ class PytestApeRunner(ManagerAccessMixin):
         https://docs.pytest.org/en/6.2.x/reference.html#pytest.hookspec.pytest_runtest_setup
         """
         if (
-            self.config_wrapper.isolation is False
+            not self.config_wrapper.isolation
             # doctests don't have fixturenames
             or (hasattr(pytest, "DoctestItem") and isinstance(item, pytest.DoctestItem))
             or "_function_isolation" in item.fixturenames  # prevent double injection
         ):
-            # isolation is disabled via cmdline option
+            # isolation is disabled via cmdline option or running doc-tests.
             return
 
-        fixture_map = item.session._fixturemanager._arg2fixturedefs
-        scopes = [
-            definition.scope
-            for name, definitions in fixture_map.items()
-            if name in item.fixturenames
-            for definition in definitions
-        ]
+        if self.config_wrapper.isolation:
+            self._setup_isolation(item)
 
-        for scope in ["session", "package", "module", "class"]:
-            # iterate through scope levels and insert the isolation fixture
-            # prior to the first fixture with that scope
-            try:
-                idx = scopes.index(scope)  # will raise ValueError if `scope` not found
-                item.fixturenames.insert(idx, f"_{scope}_isolation")
-                scopes.insert(idx, scope)
-            except ValueError:
-                # intermediate scope isolations aren't filled in
+    def _setup_isolation(self, item):
+        fixtures = self.fixture_manager.get_fixtures(item)
+        for scope in (Scope.SESSION, Scope.PACKAGE, Scope.MODULE, Scope.CLASS):
+            if not (
+                custom_fixtures := [f for f in fixtures[scope] if self.fixture_manager.is_custom(f)]
+            ):
+                # Intermediate scope isolations aren't filled in, or only using
+                # built-in Ape fixtures.
                 continue
 
-        # insert function isolation by default
-        try:
-            item.fixturenames.insert(scopes.index("function"), "_function_isolation")
-        except ValueError:
-            # no fixtures with function scope, so append function isolation
-            item.fixturenames.append("_function_isolation")
+            snapshot = self.isolation_manager.get_snapshot(scope)
+
+            # Gather new fixtures. Also, be mindful of parametrized fixtures
+            # which strangely have the same name.
+            new_fixtures = []
+            for custom_fixture in custom_fixtures:
+                # Parametrized fixtures must always be considered new
+                # because of severe complications of using them.
+                is_custom = custom_fixture in fixtures.parametrized
+                is_iterating = is_custom and fixtures.is_iterating(custom_fixture)
+                is_new = custom_fixture not in snapshot.fixtures
+
+                # NOTE: Consider ``None`` to be stateful here to be safe.
+                stateful = self.fixture_manager.is_stateful(custom_fixture) is not False
+
+                if (is_new or is_iterating) and stateful:
+                    new_fixtures.append(custom_fixture)
+                    continue
+
+            # Rebase if there are new fixtures found of non-function scope.
+            # And there are stateful fixtures of lower scopes that need resetting.
+            if self.fixture_manager.needs_rebase(new_fixtures, snapshot):
+                self.fixture_manager.rebase(scope, fixtures)
+
+            # Append these fixtures so we know when new ones arrive
+            # and need to trigger the invalidation logic above.
+            snapshot.append_fixtures(new_fixtures)
+
+        fixtures.apply_fixturenames()
 
     def pytest_sessionstart(self):
         """
@@ -197,6 +241,44 @@ class PytestApeRunner(ManagerAccessMixin):
         else:
             yield
 
+    def pytest_fixture_setup(self, fixturedef, request):
+        fixture_name = fixturedef.argname
+        if fixture_name in self._initialized_fixtures:
+            return
+
+        self._initialized_fixtures.append(fixture_name)
+        if self._track_fixture_blocks(fixture_name):
+            try:
+                block_number = self.chain_manager.blocks.height
+            except Exception:
+                pass
+            else:
+                self.fixture_manager.add_fixture_info(fixture_name, setup_block=block_number)
+
+    def pytest_fixture_post_finalizer(self, fixturedef, request):
+        fixture_name = fixturedef.argname
+        if fixture_name in self._finalized_fixtures:
+            return
+
+        self._finalized_fixtures.append(fixture_name)
+        if self._track_fixture_blocks(fixture_name):
+            try:
+                block_number = self.chain_manager.blocks.height
+            except ProviderNotConnectedError:
+                pass
+            else:
+                self.fixture_manager.add_fixture_info(fixture_name, teardown_block=block_number)
+
+    def _track_fixture_blocks(self, fixture_name: str) -> bool:
+        if not self.fixture_manager.is_custom(fixture_name):
+            return False
+
+        scope = self.fixture_manager.get_fixture_scope(fixture_name)
+        if scope in (None, Scope.FUNCTION):
+            return False
+
+        return True
+
     @pytest.hookimpl(trylast=True, hookwrapper=True)
     def pytest_collection_finish(self, session):
         """
@@ -206,8 +288,24 @@ class PytestApeRunner(ManagerAccessMixin):
 
         # Only start provider if collected tests.
         if not outcome.get_result() and session.items:
-            self._provider_context.push_provider()
-            self._provider_is_connected = True
+            self._connect()
+
+    def _connect(self):
+        if self._provider_context._provider.network.is_mainnet:
+            # Ensure is not only running on tests on mainnet because
+            # was configured as the default.
+            is_from_command_line = (
+                "--network" in self.config_wrapper.pytest_config.invocation_params.args
+            )
+            if not is_from_command_line:
+                raise ConfigError(
+                    "Default network is mainnet; unable to run tests on mainnet. "
+                    "Please specify the network using the `--network` flag or "
+                    "configure a different default network."
+                )
+
+        self._provider_context.push_provider()
+        self._provider_is_connected = True
 
     def pytest_terminal_summary(self, terminalreporter):
         """
@@ -221,7 +319,7 @@ class PytestApeRunner(ManagerAccessMixin):
 
     def _show_gas_report(self, terminalreporter):
         terminalreporter.section("Gas Profile")
-        if not self.network_manager.active_provider:
+        if not self.network_manager.connected:
             # Happens if never needed to connect (no tests)
             return
 
@@ -237,7 +335,7 @@ class PytestApeRunner(ManagerAccessMixin):
         if self.config_wrapper.ape_test_config.coverage.reports.terminal:
             terminalreporter.section("Coverage Profile")
 
-        if not self.network_manager.active_provider:
+        if not self.network_manager.connected:
             # Happens if never needed to connect (no tests)
             return
 

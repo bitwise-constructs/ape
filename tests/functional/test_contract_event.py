@@ -1,6 +1,6 @@
 import time
 from queue import Queue
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import pytest
 from eth_pydantic_types import HexBytes
@@ -8,13 +8,17 @@ from eth_pydantic_types.hash import HashBytes20
 from eth_utils import to_hex
 from ethpm_types import ContractType
 
-from ape.api import ReceiptAPI
+from ape.contracts.base import ContractEventWrapper
 from ape.exceptions import ProviderError
-from ape.types import ContractLog, CurrencyValueComparable
+from ape.types.events import ContractLog, MockContractLog
+from ape.types.units import CurrencyValueComparable
+
+if TYPE_CHECKING:
+    from ape.api.transactions import ReceiptAPI
 
 
 @pytest.fixture
-def assert_log_values(owner, chain):
+def assert_log_values(owner):
     def _assert_log_values(log: ContractLog, number: int, previous_number: Optional[int] = None):
         assert isinstance(log.b, bytes)
         expected_previous_number = number - 1 if previous_number is None else previous_number
@@ -29,7 +33,7 @@ def assert_log_values(owner, chain):
     return _assert_log_values
 
 
-def test_contract_logs_from_receipts(owner, contract_instance, assert_log_values):
+def test_from_receipts(owner, contract_instance, assert_log_values):
     event_type = contract_instance.NumberChange
 
     # Invoke a transaction 3 times that generates 3 logs.
@@ -37,7 +41,7 @@ def test_contract_logs_from_receipts(owner, contract_instance, assert_log_values
     receipt_1 = contract_instance.setNumber(2, sender=owner)
     receipt_2 = contract_instance.setNumber(3, sender=owner)
 
-    def assert_receipt_logs(receipt: ReceiptAPI, num: int):
+    def assert_receipt_logs(receipt: "ReceiptAPI", num: int):
         logs = event_type.from_receipt(receipt)
         assert len(logs) == 1
         assert_log_values(logs[0], num)
@@ -52,7 +56,7 @@ def test_contract_logs_from_receipts(owner, contract_instance, assert_log_values
     assert_receipt_logs(receipt_2, 3)
 
 
-def test_contract_logs_from_event_type(contract_instance, owner, assert_log_values):
+def test_from_event_type(contract_instance, owner, assert_log_values):
     event_type = contract_instance.NumberChange
     start_num = 6
     size = 20
@@ -73,7 +77,7 @@ def test_contract_logs_from_event_type(contract_instance, owner, assert_log_valu
             assert_log_values(log, num)
 
 
-def test_contract_logs_index_access(contract_instance, owner, assert_log_values):
+def test_index_access(contract_instance, owner, assert_log_values):
     event_type = contract_instance.NumberChange
 
     contract_instance.setNumber(1, sender=owner)
@@ -90,7 +94,7 @@ def test_contract_logs_index_access(contract_instance, owner, assert_log_values)
     assert event_type[-1] == contract_instance.NumberChange(newNum=3, prevNum=2)
 
 
-def test_contract_logs_splicing(contract_instance, owner, assert_log_values):
+def test_splicing(contract_instance, owner, assert_log_values):
     event_type = contract_instance.NumberChange
 
     contract_instance.setNumber(1, sender=owner)
@@ -110,7 +114,7 @@ def test_contract_logs_splicing(contract_instance, owner, assert_log_values):
     assert_log_values(log, 2)
 
 
-def test_contract_logs_range(chain, contract_instance, owner, assert_log_values):
+def test_range(chain, contract_instance, owner, assert_log_values):
     contract_instance.setNumber(1, sender=owner)
     start = chain.blocks.height
     logs = [
@@ -123,16 +127,16 @@ def test_contract_logs_range(chain, contract_instance, owner, assert_log_values)
     assert_log_values(logs[0], 1)
 
 
-def test_contract_logs_range_by_address(
-    mocker, chain, eth_tester_provider, test_accounts, contract_instance, owner, assert_log_values
+def test_range_by_address(
+    mocker, chain, eth_tester_provider, accounts, contract_instance, owner, assert_log_values
 ):
     get_logs_spy = mocker.spy(eth_tester_provider.tester.ethereum_tester, "get_logs")
-    contract_instance.setAddress(test_accounts[1], sender=owner)
+    contract_instance.setAddress(accounts[1], sender=owner)
     height = chain.blocks.height
     logs = [
         log
         for log in contract_instance.AddressChange.range(
-            height, height + 1, search_topics={"newAddress": test_accounts[1]}
+            height, height + 1, search_topics={"newAddress": accounts[1]}
         )
     ]
 
@@ -151,32 +155,30 @@ def test_contract_logs_range_by_address(
         ],
     }
     assert actual == expected
-    assert logs == [contract_instance.AddressChange(newAddress=test_accounts[1])]
+    assert logs == [contract_instance.AddressChange(newAddress=accounts[1])]
 
 
-def test_contracts_log_multiple_addresses(
+def test_range_multiple_addresses(
     chain, contract_instance, contract_container, owner, assert_log_values
 ):
     another_instance = contract_container.deploy(0, sender=owner)
     start_block = chain.blocks.height
     contract_instance.setNumber(1, sender=owner)
     another_instance.setNumber(1, sender=owner)
-
-    logs = [
-        log
-        for log in contract_instance.NumberChange.range(
+    logs = list(
+        contract_instance.NumberChange.range(
             start_block,
             start_block + 100,
             search_topics={"newNum": 1},
             extra_addresses=[another_instance.address],
         )
-    ]
-    assert len(logs) == 2, "Unexpected number of logs"
+    )
+    assert len(logs) == 2, f"Unexpected number of logs: {len(logs)}"
     assert logs[0] == contract_instance.NumberChange(newNum=1, prevNum=0)
     assert logs[1] == another_instance.NumberChange(newNum=1, prevNum=0)
 
 
-def test_contract_logs_range_start_and_stop(contract_instance, owner, chain):
+def test_range_start_and_stop(contract_instance, owner, chain):
     # Create 1 event
     contract_instance.setNumber(1, sender=owner)
 
@@ -191,8 +193,8 @@ def test_contract_logs_range_start_and_stop(contract_instance, owner, chain):
     assert len(logs) == 3, "Unexpected number of logs"
 
 
-def test_contract_logs_range_only_stop(contract_instance, owner, chain):
-    # Create 1 event
+def test_range_only_stop(contract_instance, owner, chain):
+    # Create 3 events
     start = chain.blocks.height
     contract_instance.setNumber(1, sender=owner)
     contract_instance.setNumber(2, sender=owner)
@@ -200,7 +202,54 @@ def test_contract_logs_range_only_stop(contract_instance, owner, chain):
 
     stop = start + 100  # Stop can be bigger than height, it doesn't not matter
     logs = [log for log in contract_instance.NumberChange.range(stop)]
-    assert len(logs) >= 3, "Unexpected number of logs"
+    assert len(logs) >= 3, f"Unexpected number of logs: {len(logs)}"
+
+
+def test_range_negative_start(contract_instance, owner):
+    # Create 2 events
+    contract_instance.setNumber(1, sender=owner)
+    contract_instance.setNumber(2, sender=owner)
+    logs = [log for log in contract_instance.NumberChange.range(-2, 0)]
+    assert len(logs) == 2
+
+
+def test_range_negative_start_and_stop(contract_instance, owner):
+    # Create 3 events
+    contract_instance.setNumber(1, sender=owner)
+    contract_instance.setNumber(2, sender=owner)
+    contract_instance.setNumber(3, sender=owner)
+
+    query_result = [log for log in contract_instance.NumberChange.range(-1, 0)]
+    assert len(query_result) == 1, "Should only be 1"
+    assert query_result[0].newNum == 3  # Was the last parameter.
+    query_result = [log for log in contract_instance.NumberChange.range(-2, -1)]
+    assert len(query_result) == 1, "Should only be 1"
+    assert query_result[0].newNum == 2  # Was the penultimate parameter.
+    query_result = [log for log in contract_instance.NumberChange.range(-3, -2)]
+    assert len(query_result) == 1, "Should only be 1"
+    assert query_result[0].newNum == 1  # Was the penultimate parameter.
+    logs = [log for log in contract_instance.NumberChange.range(-3, -1)]
+    assert len(logs) == 2
+    assert [x.newNum for x in logs] == [1, 2]
+    logs = [log for log in contract_instance.NumberChange.range(-3, 0)]
+    assert len(logs) == 3
+    assert [x.newNum for x in logs] == [1, 2, 3]
+
+
+def test_range_negative_stop_only(contract_instance, owner):
+    # Create 2 events
+    contract_instance.setNumber(1, sender=owner)
+    contract_instance.setNumber(2, sender=owner)
+
+    # Get _all_ logs.
+    logs = [log for log in contract_instance.NumberChange.range(0)]
+    assert len(logs) == 2
+    assert [x.newNum for x in logs] == [1, 2]
+
+    # Basically means go from 0 to the second to last
+    logs = [log for log in contract_instance.NumberChange.range(-1)]
+    assert len(logs) == 1
+    assert logs[0].newNum == 1
 
 
 def test_poll_logs_stop_block_not_in_future(
@@ -262,12 +311,11 @@ def test_contract_two_events_with_same_name(
     impl_container = chain.contracts.get_container(impl_contract_type)
     impl_instance = owner.deploy(impl_container)
 
-    expected_err = (
-        f"Multiple events named '{event_name}' in '{impl_contract_type.name}'.\n"
-        f"Use 'get_event_by_signature' look-up."
-    )
-    with pytest.raises(AttributeError, match=expected_err):
-        _ = impl_instance.FooEvent
+    # Show some features still work when referencing by __getattr__.
+    wrapper = impl_instance.FooEvent
+    assert isinstance(wrapper, ContractEventWrapper)
+    mock_log = wrapper(bar=16)
+    assert isinstance(mock_log, MockContractLog)
 
     expected_sig_from_impl = "FooEvent(uint256 bar, uint256 baz)"
     expected_sig_from_interface = "FooEvent(uint256 bar)"

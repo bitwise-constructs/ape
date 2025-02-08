@@ -7,7 +7,6 @@ from ethpm_types.source import ContractSource, Source
 import ape
 from ape.pytest.config import ConfigWrapper
 from ape.pytest.coverage import CoverageData, CoverageTracker
-from ape.types import SourceTraceback
 from ape.types.coverage import (
     ContractCoverage,
     ContractSourceCoverage,
@@ -16,6 +15,7 @@ from ape.types.coverage import (
     CoverageStatement,
     FunctionCoverage,
 )
+from ape.types.trace import SourceTraceback
 
 STMT_0_HIT = 12
 STMT_1_HIT = 9
@@ -255,7 +255,7 @@ class TestCoverageTracker:
 
             try:
                 # Hack in our mock compiler.
-                _ = compilers.registered_compilers  # Ensure cache is exists.
+                _ = compilers.registered_compilers  # Ensure cache exists.
                 compilers.__dict__["registered_compilers"][mock_compiler.ext] = mock_compiler
 
                 # Ensure our coverage tracker is using our new tmp project w/ the new src

@@ -5,10 +5,10 @@ from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator, Sequence
 from enum import Enum
 from functools import cached_property
-from typing import IO, Any, Optional, Union
+from typing import IO, TYPE_CHECKING, Any, Optional, Union
 
+from eth_pydantic_types import HexStr
 from eth_utils import is_0x_prefixed, to_hex
-from ethpm_types import ContractType, MethodABI
 from evm_trace import (
     CallTreeNode,
     CallType,
@@ -24,13 +24,21 @@ from hexbytes import HexBytes
 from pydantic import field_validator
 from rich.tree import Tree
 
-from ape.api import EcosystemAPI, TraceAPI, TransactionAPI
+from ape.api.trace import TraceAPI
+from ape.api.transactions import TransactionAPI
 from ape.exceptions import ContractLogicError, ProviderError, TransactionNotFoundError
 from ape.logging import get_rich_console, logger
-from ape.types import AddressType, ContractFunctionPath, GasReport
-from ape.utils import ZERO_ADDRESS, is_evm_precompile, is_zero_hex, log_instead_of_fail
+from ape.utils.misc import ZERO_ADDRESS, is_evm_precompile, is_zero_hex, log_instead_of_fail
 from ape.utils.trace import TraceStyles, _exclude_gas
 from ape_ethereum._print import extract_debug_logs
+
+if TYPE_CHECKING:
+    from ethpm_types import ContractType, MethodABI
+
+    from ape.api.networks import EcosystemAPI
+    from ape.types.address import AddressType
+    from ape.types.trace import ContractFunctionPath, GasReport
+
 
 _INDENT = 2
 _WRAP_THRESHOLD = 50
@@ -170,11 +178,11 @@ class Trace(TraceAPI):
         yield from create_trace_frames(iter(self.raw_trace_frames))
 
     @property
-    def addresses(self) -> Iterator[AddressType]:
+    def addresses(self) -> Iterator["AddressType"]:
         yield from self.get_addresses_used()
 
     @cached_property
-    def root_contract_type(self) -> Optional[ContractType]:
+    def root_contract_type(self) -> Optional["ContractType"]:
         if address := self.transaction.get("to"):
             try:
                 return self.chain_manager.contracts.get(address)
@@ -184,7 +192,7 @@ class Trace(TraceAPI):
         return None
 
     @cached_property
-    def root_method_abi(self) -> Optional[MethodABI]:
+    def root_method_abi(self) -> Optional["MethodABI"]:
         method_id = self.transaction.get("data", b"")[:10]
         if ct := self.root_contract_type:
             try:
@@ -195,7 +203,7 @@ class Trace(TraceAPI):
         return None
 
     @property
-    def _ecosystem(self) -> EcosystemAPI:
+    def _ecosystem(self) -> "EcosystemAPI":
         if provider := self.network_manager.active_provider:
             return provider.network.ecosystem
 
@@ -227,7 +235,7 @@ class Trace(TraceAPI):
 
         # Barely enrich a calltree for performance reasons
         # (likely not a need to enrich the whole thing).
-        calltree = self.get_raw_calltree()
+        calltree = self.get_calltree()
         return self._get_return_value_from_calltree(calltree)
 
     @cached_property
@@ -240,16 +248,22 @@ class Trace(TraceAPI):
 
         return self._get_return_value_from_calltree(calltree)
 
-    def _get_return_value_from_calltree(self, calltree: dict) -> tuple[Optional[Any], ...]:
+    def _get_return_value_from_calltree(
+        self, calltree: Union[dict, CallTreeNode]
+    ) -> tuple[Optional[Any], ...]:
         num_outputs = 1
-        if raw_return_data := calltree.get("returndata"):
+        if raw_return_data := (
+            calltree.get("returndata") if isinstance(calltree, dict) else calltree.returndata
+        ):
             if abi := self._get_abi(calltree):
                 # Ensure we return a tuple with the correct length, even if fails.
                 num_outputs = len(abi.outputs)
                 try:
                     return self._ecosystem.decode_returndata(abi, HexBytes(raw_return_data))
                 except Exception as err:
-                    logger.debug(f"Failed decoding raw returndata: {raw_return_data}. Error: {err}")
+                    logger.debug(
+                        f"Failed decoding raw returndata: {to_hex(raw_return_data)}. Error: {err}"
+                    )
                     return tuple([None for _ in range(num_outputs)])
 
         return tuple([None for _ in range(num_outputs)])
@@ -353,13 +367,15 @@ class Trace(TraceAPI):
 
         console.print(root)
 
-    def get_gas_report(self, exclude: Optional[Sequence[ContractFunctionPath]] = None) -> GasReport:
+    def get_gas_report(
+        self, exclude: Optional[Sequence["ContractFunctionPath"]] = None
+    ) -> "GasReport":
         call = self.enriched_calltree
         return self._get_gas_report_from_call(call, exclude=exclude)
 
     def _get_gas_report_from_call(
-        self, call: dict, exclude: Optional[Sequence[ContractFunctionPath]] = None
-    ) -> GasReport:
+        self, call: dict, exclude: Optional[Sequence["ContractFunctionPath"]] = None
+    ) -> "GasReport":
         tx = self.transaction
 
         # Enrich transfers.
@@ -384,7 +400,7 @@ class Trace(TraceAPI):
             return merge_reports(*sub_reports)
 
         elif not is_zero_hex(call["method_id"]) and not is_evm_precompile(call["method_id"]):
-            report: GasReport = {
+            report: "GasReport" = {
                 call["contract_id"]: {
                     call["method_id"]: (
                         [int(call["gas_cost"])] if call.get("gas_cost") is not None else []
@@ -430,10 +446,10 @@ class Trace(TraceAPI):
     def _get_tree(self, verbose: bool = False) -> Tree:
         return parse_rich_tree(self.enriched_calltree, verbose=verbose)
 
-    def _get_abi(self, call: dict) -> Optional[MethodABI]:
-        if not (addr := call.get("address")):
+    def _get_abi(self, call: Union[dict, CallTreeNode]) -> Optional["MethodABI"]:
+        if not (addr := call.get("address") if isinstance(call, dict) else call.address):
             return self.root_method_abi
-        if not (calldata := call.get("calldata")):
+        if not (calldata := call.get("calldata") if isinstance(call, dict) else call.calldata):
             return self.root_method_abi
         if not (contract_type := self.chain_manager.contracts.get(addr)):
             return self.root_method_abi
@@ -444,7 +460,7 @@ class Trace(TraceAPI):
 
 
 class TransactionTrace(Trace):
-    transaction_hash: str
+    transaction_hash: HexStr
     debug_trace_transaction_parameters: dict = {"enableMemory": True}
     _frames: list[dict] = []
 
@@ -489,7 +505,7 @@ class TransactionTrace(Trace):
         elif self.call_trace_approach is TraceApproach.GETH_STRUCT_LOG_PARSE:
             return self._debug_trace_transaction_struct_logs_to_call()
 
-        elif "erigon" in self.provider.client_version.lower():
+        elif "erigon" in getattr(self.provider, "client_version", "").lower():
             # Based on the client version, we know parity works.
             call = self._trace_transaction()
             self._set_approach(TraceApproach.PARITY)
@@ -522,8 +538,7 @@ class TransactionTrace(Trace):
             self._set_approach(approach)
             return call
 
-        # Not sure this would happen, as the basic-approach should
-        # always work.
+        # Not sure this happens, as the basic-approach should always work.
         reason_str = ", ".join(f"{k}={v}" for k, v in reason_map.items())
         raise ProviderError(f"Unable to create CallTreeNode. Reason(s): {reason_str}")
 

@@ -1,5 +1,7 @@
-import importlib
 from collections.abc import Generator, Iterable, Iterator
+from functools import cached_property
+from importlib import import_module
+from itertools import chain
 from typing import Any, Optional
 
 from ape.exceptions import ApeAttributeError
@@ -97,8 +99,8 @@ class PluginManager:
         hook_fn = getattr(pluggy_manager.hook, attr_name)
         hookimpls = hook_fn.get_hookimpls()
 
-        def get_plugin_name_and_hookfn(h):
-            return h.plugin_name, getattr(h.plugin, attr_name)()
+        def get_plugin_name_and_hookfn(hook):
+            return hook.plugin_name, getattr(hook.plugin, attr_name)()
 
         for plugin_name, results in map(get_plugin_name_and_hookfn, hookimpls):
             # NOTE: Some plugins return a tuple and some return iterators
@@ -113,22 +115,25 @@ class PluginManager:
                     if validated_plugin:
                         yield validated_plugin
 
-    @property
+    @cached_property
     def registered_plugins(self) -> set[str]:
-        self._register_plugins()
-        return {x[0] for x in pluggy_manager.list_name_plugin()}
+        plugins = list({n.replace("-", "_") for n in get_plugin_dists()})
+        return {*plugins, *CORE_PLUGINS}
 
     def _register_plugins(self):
         if self.__registered:
             return
 
-        plugins = list({n.replace("-", "_") for n in get_plugin_dists()})
-        plugin_modules = tuple([*plugins, *CORE_PLUGINS])
+        handled = set()
+        plugins = (n.replace("-", "_") for n in get_plugin_dists())
+        for module_name in chain(plugins, iter(CORE_PLUGINS)):
+            if module_name in handled:
+                continue
 
-        for module_name in plugin_modules:
+            handled.add(module_name)
             try:
-                module = importlib.import_module(module_name)
-                pluggy_manager.register(module)
+                module = import_module(module_name)
+                pluggy_manager.register(module, name=module_name)
             except Exception as err:
                 if module_name in CORE_PLUGINS or module_name == "ape":
                     # Always raise core plugin registration errors.

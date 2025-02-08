@@ -1,41 +1,39 @@
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import click
-from ethpm_types.abi import MethodABI
-from ethpm_types.source import ContractSource
 
 from ape.logging import logger
-from ape.managers.project import ProjectManager
-from ape.pytest.config import ConfigWrapper
-from ape.types import (
-    ContractFunctionPath,
-    ControlFlow,
-    CoverageProject,
-    CoverageReport,
-    SourceTraceback,
-)
 from ape.utils.basemodel import ManagerAccessMixin
 from ape.utils.misc import get_current_timestamp_ms
-from ape.utils.os import get_full_extension, get_relative_path
+from ape.utils.os import get_full_extension
 from ape.utils.trace import parse_coverage_tables
+
+if TYPE_CHECKING:
+    from ethpm_types.abi import MethodABI
+    from ethpm_types.source import ContractSource
+
+    from ape.managers.project import ProjectManager
+    from ape.pytest.config import ConfigWrapper
+    from ape.types.coverage import CoverageReport
+    from ape.types.trace import ContractFunctionPath, ControlFlow, SourceTraceback
 
 
 class CoverageData(ManagerAccessMixin):
     def __init__(
         self,
-        project: ProjectManager,
-        sources: Union[Iterable[ContractSource], Callable[[], Iterable[ContractSource]]],
+        project: "ProjectManager",
+        sources: Union[Iterable["ContractSource"], Callable[[], Iterable["ContractSource"]]],
     ):
         self.project = project
-        self._sources: Union[Iterable[ContractSource], Callable[[], Iterable[ContractSource]]] = (
-            sources
-        )
-        self._report: Optional[CoverageReport] = None
+        self._sources: Union[
+            Iterable["ContractSource"], Callable[[], Iterable["ContractSource"]]
+        ] = sources
+        self._report: Optional["CoverageReport"] = None
 
     @property
-    def sources(self) -> list[ContractSource]:
+    def sources(self) -> list["ContractSource"]:
         if isinstance(self._sources, list):
             return self._sources
 
@@ -47,7 +45,7 @@ class CoverageData(ManagerAccessMixin):
         return self._sources
 
     @property
-    def report(self) -> CoverageReport:
+    def report(self) -> "CoverageReport":
         if self._report is None:
             self._report = self._init_coverage_profile()
 
@@ -59,7 +57,9 @@ class CoverageData(ManagerAccessMixin):
 
     def _init_coverage_profile(
         self,
-    ) -> CoverageReport:
+    ) -> "CoverageReport":
+        from ape.types.coverage import CoverageProject, CoverageReport
+
         # source_id -> pc(s) -> times hit
         project_coverage = CoverageProject(name=self.project.name or "__local__")
 
@@ -92,7 +92,7 @@ class CoverageData(ManagerAccessMixin):
         self, src_path: Path, pcs: Iterable[int], inc_fn_hits: bool = True
     ) -> tuple[set[int], list[str]]:
         if hasattr(self.project, "path"):
-            source_id = str(get_relative_path(src_path.absolute(), self.project.path))
+            source_id = f"{src_path.relative_to(self.project.path)}"
         else:
             source_id = str(src_path)
 
@@ -143,8 +143,8 @@ class CoverageData(ManagerAccessMixin):
 class CoverageTracker(ManagerAccessMixin):
     def __init__(
         self,
-        config_wrapper: ConfigWrapper,
-        project: Optional[ProjectManager] = None,
+        config_wrapper: "ConfigWrapper",
+        project: Optional["ProjectManager"] = None,
         output_path: Optional[Path] = None,
     ):
         self.config_wrapper = config_wrapper
@@ -163,7 +163,7 @@ class CoverageTracker(ManagerAccessMixin):
 
     @property
     def data(self) -> Optional[CoverageData]:
-        if not self.config_wrapper.track_coverage:
+        if not self.enabled:
             return None
 
         elif self._data is None:
@@ -178,7 +178,7 @@ class CoverageTracker(ManagerAccessMixin):
         return self.config_wrapper.track_coverage
 
     @property
-    def exclusions(self) -> list[ContractFunctionPath]:
+    def exclusions(self) -> list["ContractFunctionPath"]:
         return self.config_wrapper.coverage_exclusions
 
     def reset(self):
@@ -187,7 +187,7 @@ class CoverageTracker(ManagerAccessMixin):
 
     def cover(
         self,
-        traceback: SourceTraceback,
+        traceback: "SourceTraceback",
         contract: Optional[str] = None,
         function: Optional[str] = None,
     ):
@@ -264,7 +264,7 @@ class CoverageTracker(ManagerAccessMixin):
 
     def _cover(
         self,
-        control_flow: ControlFlow,
+        control_flow: "ControlFlow",
         last_path: Optional[Path] = None,
         last_pcs: Optional[set[int]] = None,
         last_call: Optional[str] = None,
@@ -286,7 +286,7 @@ class CoverageTracker(ManagerAccessMixin):
         inc_fn = last_call is None or last_call != control_flow.closure.full_name
         return self.data.cover(control_flow.source_path, new_pcs, inc_fn_hits=inc_fn)
 
-    def hit_function(self, contract_source: ContractSource, method: MethodABI):
+    def hit_function(self, contract_source: "ContractSource", method: "MethodABI"):
         """
         Another way to increment a function's hit count. Providers may not offer a
         way to trace calls but this method is available to still increment function

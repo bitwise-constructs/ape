@@ -3,6 +3,14 @@ import functools
 import inspect
 import json
 import sys
+
+if sys.version_info.minor >= 11:
+    # 3.11 or greater
+    # NOTE: type-ignore is for when running mypy on python versions < 3.11
+    import tomllib  # type: ignore[import-not-found]
+else:
+    import toml as tomllib  # type: ignore[no-redef]
+
 from asyncio import gather
 from collections.abc import Coroutine, Mapping
 from datetime import datetime, timezone
@@ -22,7 +30,7 @@ from ape.logging import logger
 from ape.utils.os import expand_environment_variables
 
 if TYPE_CHECKING:
-    from ape.types import AddressType
+    from ape.types.address import AddressType
 
 
 EMPTY_BYTES32 = HexBytes("0x0000000000000000000000000000000000000000000000000000000000000000")
@@ -32,6 +40,7 @@ DEFAULT_LOCAL_TRANSACTION_ACCEPTANCE_TIMEOUT = 20
 DEFAULT_LIVE_NETWORK_BASE_FEE_MULTIPLIER = 1.4
 DEFAULT_TRANSACTION_TYPE = 0
 DEFAULT_MAX_RETRIES_TX = 20
+LOCAL_NETWORK_NAME = "local"
 SOURCE_EXCLUDE_PATTERNS = (
     ".build",
     ".cache",
@@ -54,7 +63,7 @@ SOURCE_EXCLUDE_PATTERNS = (
 )
 
 
-_python_version = (
+_python_version: str = (
     f"{sys.version_info.major}.{sys.version_info.minor}"
     f".{sys.version_info.micro} {sys.version_info.releaselevel}"
 )
@@ -184,7 +193,7 @@ def get_package_version(obj: Any) -> str:
         return ""
 
 
-__version__ = get_package_version(__name__)
+__version__: str = get_package_version(__name__)
 
 
 def load_config(path: Path, expand_envars=True, must_exist=False) -> dict:
@@ -208,7 +217,16 @@ def load_config(path: Path, expand_envars=True, must_exist=False) -> dict:
         if expand_envars:
             contents = expand_environment_variables(contents)
 
-        if path.suffix in (".json",):
+        if path.name == "pyproject.toml":
+            pyproject_toml = tomllib.loads(contents)
+            config = pyproject_toml.get("tool", {}).get("ape", {})
+
+            # Utilize [project] for some settings.
+            if project_settings := pyproject_toml.get("project"):
+                if "name" not in config and "name" in project_settings:
+                    config["name"] = project_settings["name"]
+
+        elif path.suffix in (".json",):
             config = json.loads(contents)
         elif path.suffix in (".yml", ".yaml"):
             config = yaml.safe_load(contents)
@@ -521,6 +539,7 @@ __all__ = [
     "is_evm_precompile",
     "is_zero_hex",
     "load_config",
+    "LOCAL_NETWORK_NAME",
     "log_instead_of_fail",
     "nonreentrant",
     "raises_not_implemented",

@@ -1,5 +1,6 @@
+from abc import abstractmethod
 from collections.abc import Iterator, Sequence
-from functools import cache
+from functools import cache, cached_property
 from typing import Any, Optional, Union
 
 from ethpm_types.abi import EventABI, MethodABI
@@ -7,9 +8,8 @@ from pydantic import NonNegativeInt, PositiveInt, model_validator
 
 from ape.api.transactions import ReceiptAPI, TransactionAPI
 from ape.logging import logger
-from ape.types import AddressType
-from ape.utils import BaseInterface, BaseInterfaceModel, abstractmethod, cached_property
-from ape.utils.basemodel import BaseModel
+from ape.types.address import AddressType
+from ape.utils.basemodel import BaseInterface, BaseInterfaceModel, BaseModel
 
 QueryType = Union[
     "BlockQuery",
@@ -23,7 +23,7 @@ QueryType = Union[
 
 @cache
 def _basic_columns(Model: type[BaseInterfaceModel]) -> set[str]:
-    columns = set(Model.model_fields)
+    columns = set(Model.__pydantic_fields__)
 
     # TODO: Remove once `ReceiptAPI` fields cleaned up for better processing
     if Model == ReceiptAPI:

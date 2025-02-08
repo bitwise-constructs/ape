@@ -1,6 +1,7 @@
 import copy
+from abc import abstractmethod
 from collections.abc import Collection, Iterator, Sequence
-from functools import partial
+from functools import cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union
 
@@ -11,8 +12,7 @@ from eth_account._utils.signing import (
 )
 from eth_pydantic_types import HexBytes
 from eth_utils import keccak, to_int
-from ethpm_types import BaseModel, ContractType
-from ethpm_types.abi import ABIType, ConstructorABI, EventABI, MethodABI
+from evmchains import PUBLIC_CHAIN_META
 from pydantic import model_validator
 
 from ape.exceptions import (
@@ -25,30 +25,36 @@ from ape.exceptions import (
     SignatureError,
 )
 from ape.logging import logger
-from ape.types import AddressType, AutoGasLimit, ContractLog, GasLimit, RawAddress
-from ape.utils import (
-    DEFAULT_TRANSACTION_ACCEPTANCE_TIMEOUT,
+from ape.types.address import AddressType
+from ape.types.gas import AutoGasLimit, GasLimit
+from ape.utils.basemodel import (
     BaseInterfaceModel,
+    BaseModel,
     ExtraAttributesMixin,
     ExtraModelAttributes,
     ManagerAccessMixin,
-    RPCHeaders,
-    abstractmethod,
-    cached_property,
+)
+from ape.utils.misc import (
+    DEFAULT_TRANSACTION_ACCEPTANCE_TIMEOUT,
+    LOCAL_NETWORK_NAME,
     log_instead_of_fail,
     raises_not_implemented,
 )
+from ape.utils.rpc import RPCHeaders
 
 from .config import PluginConfig
 
 if TYPE_CHECKING:
+    from ethpm_types import ContractType
+    from ethpm_types.abi import ABIType, ConstructorABI, EventABI, MethodABI
+
+    from ape.types.address import RawAddress
+    from ape.types.events import ContractLog
+
     from .explorers import ExplorerAPI
     from .providers import BlockAPI, ProviderAPI, UpstreamProvider
     from .trace import TraceAPI
     from .transactions import ReceiptAPI, TransactionAPI
-
-
-LOCAL_NETWORK_NAME = "local"
 
 
 class ProxyInfoAPI(BaseModel):
@@ -58,6 +64,43 @@ class ProxyInfoAPI(BaseModel):
 
     target: AddressType
     """The address of the implementation contract."""
+
+    type_name: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_type_name(cls, model):
+        if "type_name" in model:
+            return model
+
+        elif _type := model.get("type"):
+            # Attempt to figure out the type name.
+            if name := getattr(_type, "name", None):
+                # ProxyEnum - such as from 'ape-ethereum'.
+                model["type_name"] = name
+            else:
+                # Not sure.
+                try:
+                    model["type_name"] = f"{_type}"
+                except Exception:
+                    pass
+
+        return model
+
+    @log_instead_of_fail(default="<ProxyInfoAPI>")
+    def __repr__(self) -> str:
+        if _type := self.type_name:
+            return f"<Proxy {_type} target={self.target}>"
+
+        return "<Proxy target={self.target}"
+
+    @property
+    def abi(self) -> Optional["MethodABI"]:
+        """
+        Some proxies have special ABIs which may not exist in their
+        contract-types by default, such as Safe's ``masterCopy()``.
+        """
+        return None
 
 
 class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
@@ -104,13 +147,12 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         """
         return self.config_manager.DATA_FOLDER / self.name
 
-    @cached_property
+    @property
     def custom_network(self) -> "NetworkAPI":
         """
         A :class:`~ape.api.networks.NetworkAPI` for custom networks where the
         network is either not known, unspecified, or does not have an Ape plugin.
         """
-
         ethereum_class = None
         for plugin_name, ecosystem_class in self.plugin_manager.ecosystems:
             if plugin_name == "ethereum":
@@ -120,20 +162,18 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         if ethereum_class is None:
             raise NetworkError("Core Ethereum plugin missing.")
 
-        request_header = self.config_manager.REQUEST_HEADER
-        init_kwargs = {"name": "ethereum", "request_header": request_header}
-        ethereum = ethereum_class(**init_kwargs)  # type: ignore
+        init_kwargs = {"name": "ethereum"}
+        evm_ecosystem = ethereum_class(**init_kwargs)  # type: ignore
         return NetworkAPI(
             name="custom",
-            ecosystem=ethereum,
-            request_header=request_header,
+            ecosystem=evm_ecosystem,
             _default_provider="node",
             _is_custom=True,
         )
 
     @classmethod
     @abstractmethod
-    def decode_address(cls, raw_address: RawAddress) -> AddressType:
+    def decode_address(cls, raw_address: "RawAddress") -> AddressType:
         """
         Convert a raw address to the ecosystem's native address type.
 
@@ -147,7 +187,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
 
     @classmethod
     @abstractmethod
-    def encode_address(cls, address: AddressType) -> RawAddress:
+    def encode_address(cls, address: AddressType) -> "RawAddress":
         """
         Convert the ecosystem's native address type to a raw integer or str address.
 
@@ -160,7 +200,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
 
     @raises_not_implemented
     def encode_contract_blueprint(  # type: ignore[empty-body]
-        self, contract_type: ContractType, *args, **kwargs
+        self, contract_type: "ContractType", *args, **kwargs
     ) -> "TransactionAPI":
         """
         Encode a unique type of transaction that allows contracts to be created
@@ -246,9 +286,53 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         Returns:
             dict[str, :class:`~ape.api.networks.NetworkAPI`]
         """
-        networks = {**self._networks_from_plugins}
+        return {
+            **self._networks_from_evmchains,
+            **self._networks_from_plugins,
+            **self._custom_networks,
+        }
 
-        # Include configured custom networks.
+    @cached_property
+    def _networks_from_plugins(self) -> dict[str, "NetworkAPI"]:
+        return {
+            network_name: network_class(name=network_name, ecosystem=self)
+            for _, (ecosystem_name, network_name, network_class) in self.plugin_manager.networks
+            if ecosystem_name == self.name
+        }
+
+    @cached_property
+    def _networks_from_evmchains(self) -> dict[str, "NetworkAPI"]:
+        # NOTE: Purposely exclude plugins here so we also prefer plugins.
+        networks = {
+            network_name: create_network_type(data["chainId"], data["chainId"])(
+                name=network_name, ecosystem=self
+            )
+            for network_name, data in PUBLIC_CHAIN_META.get(self.name, {}).items()
+            if network_name not in self._networks_from_plugins
+        }
+        forked_networks: dict[str, ForkedNetworkAPI] = {}
+        for network_name, network in networks.items():
+            if network_name.endswith("-fork"):
+                # Already a fork.
+                continue
+
+            fork_network_name = f"{network_name}-fork"
+            if any(x == fork_network_name for x in networks):
+                # The forked version of this network is already known.
+                continue
+
+            forked_networks[fork_network_name] = ForkedNetworkAPI(
+                name=fork_network_name, ecosystem=self
+            )
+
+        return {**networks, **forked_networks}
+
+    @property
+    def _custom_networks(self) -> dict[str, "NetworkAPI"]:
+        """
+        Networks from config.
+        """
+        networks: dict[str, "NetworkAPI"] = {}
         custom_networks: list[dict] = [
             n
             for n in self.network_manager.custom_networks
@@ -297,14 +381,6 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
             networks[net_name] = network_api
 
         return networks
-
-    @cached_property
-    def _networks_from_plugins(self) -> dict[str, "NetworkAPI"]:
-        return {
-            network_name: network_class(name=network_name, ecosystem=self)
-            for _, (ecosystem_name, network_name, network_class) in self.plugin_manager.networks
-            if ecosystem_name == self.name
-        }
 
     def __post_init__(self):
         if len(self.networks) == 0:
@@ -384,7 +460,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
 
     @abstractmethod
     def encode_deployment(
-        self, deployment_bytecode: HexBytes, abi: ConstructorABI, *args, **kwargs
+        self, deployment_bytecode: HexBytes, abi: "ConstructorABI", *args, **kwargs
     ) -> "TransactionAPI":
         """
         Create a deployment transaction in the given ecosystem.
@@ -402,7 +478,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
 
     @abstractmethod
     def encode_transaction(
-        self, address: AddressType, abi: MethodABI, *args, **kwargs
+        self, address: AddressType, abi: "MethodABI", *args, **kwargs
     ) -> "TransactionAPI":
         """
         Encode a transaction object from a contract function's ABI and call arguments.
@@ -419,12 +495,12 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         """
 
     @abstractmethod
-    def decode_logs(self, logs: Sequence[dict], *events: EventABI) -> Iterator["ContractLog"]:
+    def decode_logs(self, logs: Sequence[dict], *events: "EventABI") -> Iterator["ContractLog"]:
         """
         Decode any contract logs that match the given event ABI from the raw log data.
 
         Args:
-            logs (Sequence[Dict]): A list of raw log data from the chain.
+            logs (Sequence[dict]): A list of raw log data from the chain.
             *events (EventABI): Event definitions to decode.
 
         Returns:
@@ -462,7 +538,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         """
 
     @abstractmethod
-    def decode_calldata(self, abi: Union[ConstructorABI, MethodABI], calldata: bytes) -> dict:
+    def decode_calldata(self, abi: Union["ConstructorABI", "MethodABI"], calldata: bytes) -> dict:
         """
         Decode method calldata.
 
@@ -477,7 +553,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         """
 
     @abstractmethod
-    def encode_calldata(self, abi: Union[ConstructorABI, MethodABI], *args: Any) -> HexBytes:
+    def encode_calldata(self, abi: Union["ConstructorABI", "MethodABI"], *args: Any) -> HexBytes:
         """
         Encode method calldata.
 
@@ -490,7 +566,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         """
 
     @abstractmethod
-    def decode_returndata(self, abi: MethodABI, raw_data: bytes) -> Any:
+    def decode_returndata(self, abi: "MethodABI", raw_data: bytes) -> Any:
         """
         Get the result of a contract call.
 
@@ -500,6 +576,18 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
 
         Returns:
             Any: All of the values returned from the contract function.
+        """
+
+    @raises_not_implemented
+    def get_deployment_address(  # type: ignore[empty-body]
+        self,
+        address: AddressType,
+        nonce: int,
+    ) -> AddressType:
+        """
+        Calculate the deployment address of a contract before it is deployed.
+        This is useful if the address is an argument to another contract's deployment
+        and you have not yet deployed the first contract yet.
         """
 
     def get_network(self, network_name: str) -> "NetworkAPI":
@@ -515,7 +603,6 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         Returns:
           :class:`~ape.api.networks.NetworkAPI`
         """
-
         names = {network_name, network_name.replace("-", "_"), network_name.replace("_", "-")}
         networks = self.networks
         for name in names:
@@ -584,7 +671,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
         """
         return None
 
-    def get_method_selector(self, abi: MethodABI) -> HexBytes:
+    def get_method_selector(self, abi: "MethodABI") -> HexBytes:
         """
         Get a contract method selector, typically via hashing such as ``keccak``.
         Defaults to using ``keccak`` but can be overridden in different ecosystems.
@@ -624,7 +711,7 @@ class EcosystemAPI(ExtraAttributesMixin, BaseInterfaceModel):
 
     @raises_not_implemented
     def get_python_types(  # type: ignore[empty-body]
-        self, abi_type: ABIType
+        self, abi_type: "ABIType"
     ) -> Union[type, Sequence]:
         """
         Get the Python types for a given ABI type.
@@ -719,7 +806,6 @@ class ProviderContextManager(ManagerAccessMixin):
         """
         ``True`` when there are no providers in the context.
         """
-
         return not self.connected_providers or not self.provider_stack
 
     def __enter__(self, *args, **kwargs):
@@ -775,7 +861,7 @@ class ProviderContextManager(ManagerAccessMixin):
         current_id = self.provider_stack.pop()
 
         # Disconnect the provider in same cases.
-        if self.disconnect_map[current_id]:
+        if self.disconnect_map.get(current_id):
             if provider := self.network_manager.active_provider:
                 provider.disconnect()
 
@@ -807,7 +893,7 @@ class ProviderContextManager(ManagerAccessMixin):
         self.connected_providers = {}
 
 
-def _set_provider(provider: "ProviderAPI") -> "ProviderAPI":
+def _connect_provider(provider: "ProviderAPI") -> "ProviderAPI":
     connection_id = provider.connection_id
     if connection_id in ProviderContextManager.connected_providers:
         # Likely multi-chain testing or utilizing multiple on-going connections.
@@ -875,7 +961,7 @@ class NetworkAPI(BaseInterfaceModel):
         The configuration of the network. See :class:`~ape.managers.config.ConfigManager`
         for more information on plugin configurations.
         """
-        return self.config_manager.get_config(self.ecosystem.name)
+        return self.ecosystem.config
 
     @property
     def config(self) -> PluginConfig:
@@ -918,7 +1004,6 @@ class NetworkAPI(BaseInterfaceModel):
         **NOTE**: Unless overridden, returns same as
         :py:attr:`ape.api.providers.ProviderAPI.chain_id`.
         """
-
         return self.provider.chain_id
 
     @property
@@ -953,7 +1038,6 @@ class NetworkAPI(BaseInterfaceModel):
               mainnet:
                 block_time: 15
         """
-
         return self.config.get("block_time", 0)
 
     @property
@@ -975,8 +1059,8 @@ class NetworkAPI(BaseInterfaceModel):
         Returns:
             :class:`ape.api.explorers.ExplorerAPI`, optional
         """
-
-        for plugin_name, plugin_tuple in self.plugin_manager.explorers:
+        chain_id = None if self.network_manager.active_provider is None else self.provider.chain_id
+        for plugin_name, plugin_tuple in self._plugin_explorers:
             ecosystem_name, network_name, explorer_class = plugin_tuple
 
             # Check for explicitly configured custom networks
@@ -987,16 +1071,22 @@ class NetworkAPI(BaseInterfaceModel):
                 and self.name in plugin_config[self.ecosystem.name]
             )
 
+            # Return the first registered explorer (skipping any others)
             if self.ecosystem.name == ecosystem_name and (
                 self.name == network_name or has_explorer_config
             ):
-                # Return the first registered explorer (skipping any others)
-                return explorer_class(
-                    name=plugin_name,
-                    network=self,
-                )
+                return explorer_class(name=plugin_name, network=self)
+
+            elif chain_id is not None and explorer_class.supports_chain(chain_id):
+                # NOTE: Adhoc networks will likely reach here.
+                return explorer_class(name=plugin_name, network=self)
 
         return None  # May not have an block explorer
+
+    @property
+    def _plugin_explorers(self) -> list[tuple]:
+        # Abstracted for testing purposes.
+        return self.plugin_manager.explorers
 
     @property
     def is_mainnet(self) -> bool:
@@ -1038,6 +1128,13 @@ class NetworkAPI(BaseInterfaceModel):
         """
         return self.name == "custom" and not self._is_custom
 
+    @property
+    def is_custom(self) -> bool:
+        """
+        True when this network is a configured custom network.
+        """
+        return self._is_custom
+
     @cached_property
     def providers(self):  # -> dict[str, Partial[ProviderAPI]]
         """
@@ -1046,13 +1143,13 @@ class NetworkAPI(BaseInterfaceModel):
         Returns:
             dict[str, partial[:class:`~ape.api.providers.ProviderAPI`]]
         """
-
-        from ape.plugins._utils import clean_plugin_name
-
         providers = {}
         for _, plugin_tuple in self._get_plugin_providers():
             ecosystem_name, network_name, provider_class = plugin_tuple
-            provider_name = clean_plugin_name(provider_class.__module__.split(".")[0])
+            provider_name = (
+                provider_class.__module__.split(".")[0].replace("_", "-").replace("ape-", "")
+            )
+
             is_custom_with_config = self._is_custom and self.default_provider_name == provider_name
             # NOTE: Custom networks that are NOT from config must work with any provider.
             #    Also, ensure we are only adding forked providers for forked networks and
@@ -1061,22 +1158,31 @@ class NetworkAPI(BaseInterfaceModel):
             # TODO: In 0.9, add a better way for class-level ForkedProviders to define
             #   themselves as "Fork" providers.
             if (
-                self.is_adhoc
-                or (self.ecosystem.name == ecosystem_name and self.name == network_name)
+                (self.ecosystem.name == ecosystem_name and self.name == network_name)
+                or self.is_adhoc
                 or (
                     is_custom_with_config
                     and (
                         (self.is_fork and "Fork" in provider_class.__name__)
                         or (not self.is_fork and "Fork" not in provider_class.__name__)
                     )
+                    and provider_class.__name__
+                    == "Node"  # Ensure uses Node class instead of GethDev
                 )
             ):
                 # NOTE: Lazily load provider config
+                provider_name = provider_class.NAME or provider_name
                 providers[provider_name] = partial(
                     provider_class,
                     name=provider_name,
                     network=self,
                 )
+
+        # Any EVM-chain works with node provider.
+        if "node" not in providers and self.name in self.ecosystem._networks_from_evmchains:
+            # NOTE: Arbitrarily using sepolia to access the Node class.
+            node_provider_cls = self.network_manager.ethereum.sepolia.get_provider("node").__class__
+            providers["node"] = partial(node_provider_cls, name="node", network=self)
 
         return providers
 
@@ -1084,10 +1190,16 @@ class NetworkAPI(BaseInterfaceModel):
         # NOTE: Abstracted for testing purposes.
         return self.plugin_manager.providers
 
+    def _get_plugin_provider_names(self) -> Iterator[str]:
+        for _, plugin_tuple in self._get_plugin_providers():
+            ecosystem_name, network_name, provider_class = plugin_tuple
+            yield provider_class.__module__.split(".")[0].replace("_", "-").replace("ape-", "")
+
     def get_provider(
         self,
         provider_name: Optional[str] = None,
         provider_settings: Optional[dict] = None,
+        connect: bool = False,
     ):
         """
         Get a provider for the given name. If given ``None``, returns the default provider.
@@ -1097,24 +1209,20 @@ class NetworkAPI(BaseInterfaceModel):
               When ``None``, returns the default provider.
             provider_settings (dict, optional): Settings to apply to the provider. Defaults to
               ``None``.
+            connect (bool): Set to ``True`` when you also want the provider to connect.
 
         Returns:
             :class:`~ape.api.providers.ProviderAPI`
         """
-        provider_name = provider_name or self.default_provider_name
-        if not provider_name:
-            from ape.managers.config import CONFIG_FILE_NAME
-
+        if not (provider_name := provider_name or self.default_provider_name):
             raise NetworkError(
                 f"No default provider for network '{self.name}'. "
-                f"Set one in your {CONFIG_FILE_NAME}:\n"
+                "Set one in your pyproject.toml/ape-config.yaml file:\n"
                 f"\n{self.ecosystem.name}:"
                 f"\n  {self.name}:"
                 "\n    default_provider: <DEFAULT_PROVIDER>"
             )
-
         provider_settings = provider_settings or {}
-
         if ":" in provider_name:
             # NOTE: Shortcut that allows `--network ecosystem:network:http://...` to work
             provider_settings["uri"] = provider_name
@@ -1124,19 +1232,20 @@ class NetworkAPI(BaseInterfaceModel):
             provider_settings["ipc_path"] = provider_name
             provider_name = "node"
 
-        # If it can fork Ethereum (and we are asking for it) assume it can fork this one.
-        # TODO: Refactor this approach to work for custom-forked non-EVM networks.
-        common_forking_providers = self.network_manager.ethereum.mainnet_fork.providers
         if provider_name in self.providers:
             provider = self.providers[provider_name](provider_settings=provider_settings)
-            return _set_provider(provider)
+            return _connect_provider(provider) if connect else provider
 
-        elif self.is_fork and provider_name in common_forking_providers:
-            provider = common_forking_providers[provider_name](
-                provider_settings=provider_settings,
-                network=self,
-            )
-            return _set_provider(provider)
+        elif self.is_fork:
+            # If it can fork Ethereum (and we are asking for it) assume it can fork this one.
+            # TODO: Refactor this approach to work for custom-forked non-EVM networks.
+            common_forking_providers = self.network_manager.ethereum.mainnet_fork.providers
+            if provider_name in common_forking_providers:
+                provider = common_forking_providers[provider_name](
+                    provider_settings=provider_settings,
+                    network=self,
+                )
+                return _connect_provider(provider) if connect else provider
 
         raise ProviderNotFoundError(
             provider_name,
@@ -1185,7 +1294,7 @@ class NetworkAPI(BaseInterfaceModel):
         # NOTE: The main reason we allow a provider instance here is to avoid unnecessarily
         #   re-initializing the class.
         provider_obj = (
-            self.get_provider(provider_name=provider, provider_settings=settings)
+            self.get_provider(provider_name=provider, provider_settings=settings, connect=True)
             if isinstance(provider, str)
             else provider
         )
@@ -1345,7 +1454,6 @@ class ForkedNetworkAPI(NetworkAPI):
         When not set, will attempt to use the default provider, if one
         exists.
         """
-
         config_choice: str = self.config.get("upstream_provider")
         if provider_name := config_choice or self.upstream_network.default_provider_name:
             return self.upstream_network.get_provider(provider_name)
@@ -1389,3 +1497,15 @@ def create_network_type(chain_id: int, network_id: int, is_fork: bool = False) -
             return network_id
 
     return network_def
+
+
+# TODO: Can remove in 0.9 since `LOCAL_NETWORK_NAME` doesn't need to be here.
+__all__ = [
+    "create_network_type",
+    "EcosystemAPI",
+    "LOCAL_NETWORK_NAME",  # Have to leave for backwards compat.
+    "ForkedNetworkAPI",
+    "NetworkAPI",
+    "ProviderContextManager",
+    "ProxyInfoAPI",
+]

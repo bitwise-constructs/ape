@@ -63,7 +63,7 @@ jobs:
         strategy:
             matrix:
                 os: [ubuntu-latest, macos-latest]   # eventually add `windows-latest`
-                python-version: [3.9, "3.10", "3.11", "3.12"]
+                python-version: [3.9, "3.10", "3.11", "3.12", "3.13"]
 
         env:
           GITHUB_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -86,7 +86,7 @@ jobs:
         - name: Install Geth
           uses: gacts/install-geth-tools@v1
           with:
-            version: 1.14.5
+            version: 1.14.12
 
         - name: Install Dependencies
           run: |
@@ -95,13 +95,13 @@ jobs:
             pip install .[test]
 
         - name: Run Functional Tests
-          run: pytest tests/functional -m "not fuzzing" -s --cov=src --cov-append -n auto --dist loadgroup
+          run: ape test tests/functional -m "not fuzzing" -s --cov=src --cov-append -n auto --dist loadgroup
 
         - name: Run Integration Tests
-          run: pytest tests/integration -m "not fuzzing" -s --cov=src --cov-append -n auto --dist loadgroup
+          run: ape test tests/integration -m "not fuzzing" -s --cov=src --cov-append -n auto --dist loadgroup
 
         - name: Run Performance Tests
-          run: pytest tests/performance -s
+          run: ape test tests/performance -s
 
     fuzzing:
         runs-on: ubuntu-latest
@@ -123,4 +123,4 @@ jobs:
             pip install .[test]
 
         - name: Run Tests
-          run: pytest -m "fuzzing" --no-cov -s
+          run: ape test -m "fuzzing" --no-cov -s

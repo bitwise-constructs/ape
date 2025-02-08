@@ -3,25 +3,31 @@ import warnings
 from collections.abc import Iterator
 from os import environ
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import click
 from eip712.messages import EIP712Message
 from eth_account import Account as EthAccount
 from eth_account.hdaccount import ETHEREUM_DEFAULT_PATH
 from eth_account.messages import encode_defunct
-from eth_account.signers.local import LocalAccount
 from eth_keys import keys  # type: ignore
 from eth_pydantic_types import HexBytes
 from eth_utils import to_bytes, to_hex
 
-from ape.api import AccountAPI, AccountContainerAPI, TransactionAPI
+from ape.api.accounts import AccountAPI, AccountContainerAPI
 from ape.exceptions import AccountsError
 from ape.logging import logger
-from ape.types import AddressType, MessageSignature, SignableMessage, TransactionSignature
+from ape.types.signatures import MessageSignature, SignableMessage, TransactionSignature
+from ape.utils._web3_compat import sign_hash
 from ape.utils.basemodel import ManagerAccessMixin
 from ape.utils.misc import log_instead_of_fail
 from ape.utils.validators import _validate_account_alias, _validate_account_passphrase
+
+if TYPE_CHECKING:
+    from eth_account.signers.local import LocalAccount
+
+    from ape.api.transactions import TransactionAPI
+    from ape.types.address import AddressType
 
 
 class InvalidPasswordError(AccountsError):
@@ -81,7 +87,7 @@ class KeyfileAccount(AccountAPI):
         return json.loads(self.keyfile_path.read_text())
 
     @property
-    def address(self) -> AddressType:
+    def address(self) -> "AddressType":
         return self.network_manager.ethereum.decode_address(self.keyfile["address"])
 
     @property
@@ -218,7 +224,9 @@ class KeyfileAccount(AccountAPI):
             s=to_bytes(signed_msg.s),
         )
 
-    def sign_transaction(self, txn: TransactionAPI, **signer_options) -> Optional[TransactionAPI]:
+    def sign_transaction(
+        self, txn: "TransactionAPI", **signer_options
+    ) -> Optional["TransactionAPI"]:
         user_approves = self.__autosign or click.confirm(f"{txn}\n\nSign: ")
         if not user_approves:
             return None
@@ -241,14 +249,14 @@ class KeyfileAccount(AccountAPI):
         )
 
         # NOTE: Signing a raw hash is so dangerous, we don't want to allow autosigning it
-        if not click.confirm("Please confirm you wish to sign using `EthAccount.unsafe_sign_hash`"):
+        if not click.confirm("Please confirm you wish to sign using `EthAccount.signHash`"):
             return None
 
         # Ignoring misleading deprecated warning from web3.py.
         # Also, we have already warned the user about the safety.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            signed_msg = EthAccount.unsafe_sign_hash(msghash, self.__key)
+            signed_msg = sign_hash(msghash, self.__key)
 
         return MessageSignature(
             v=signed_msg.v,
@@ -290,7 +298,9 @@ class KeyfileAccount(AccountAPI):
             raise InvalidPasswordError() from err
 
 
-def _write_and_return_account(alias: str, passphrase: str, account: LocalAccount) -> KeyfileAccount:
+def _write_and_return_account(
+    alias: str, passphrase: str, account: "LocalAccount"
+) -> KeyfileAccount:
     """Write an account to disk and return an Ape KeyfileAccount"""
     path = ManagerAccessMixin.account_manager.containers["accounts"].data_folder.joinpath(
         f"{alias}.json"

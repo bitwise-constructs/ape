@@ -1,19 +1,27 @@
 from collections.abc import Iterator
+from functools import singledispatchmethod
 from pathlib import Path
 from typing import Any, Optional, cast
 
 from sqlalchemy import create_engine, func
-from sqlalchemy.engine import CursorResult
+from sqlalchemy.engine import CursorResult  # noqa: TC002
 from sqlalchemy.sql import column, insert, select
-from sqlalchemy.sql.expression import Insert, Select
+from sqlalchemy.sql.expression import Insert, Select  # noqa: TC002
 
-from ape.api import BlockAPI, QueryAPI, QueryType, TransactionAPI
-from ape.api.networks import LOCAL_NETWORK_NAME
-from ape.api.query import BaseInterfaceModel, BlockQuery, BlockTransactionQuery, ContractEventQuery
+from ape.api.providers import BlockAPI  # noqa: TC002
+from ape.api.query import (
+    BaseInterfaceModel,
+    BlockQuery,
+    BlockTransactionQuery,
+    ContractEventQuery,
+    QueryAPI,
+    QueryType,
+)
+from ape.api.transactions import TransactionAPI
 from ape.exceptions import QueryEngineError
 from ape.logging import logger
-from ape.types import ContractLog
-from ape.utils import singledispatchmethod
+from ape.types.events import ContractLog
+from ape.utils.misc import LOCAL_NETWORK_NAME
 
 from . import models
 from .models import Blocks, ContractEvents, Transactions
@@ -121,7 +129,7 @@ class CacheQueryProvider(QueryAPI):
         if self.provider.network.is_local:
             return None
 
-        if not self.network_manager.active_provider:
+        if not self.network_manager.connected:
             raise QueryEngineError("Not connected to a provider")
 
         database_file = self._get_database_file(

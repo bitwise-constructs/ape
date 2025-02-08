@@ -1,27 +1,24 @@
+from abc import abstractmethod
 from collections.abc import Iterable, Iterator
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from eth_pydantic_types import HexBytes
-from ethpm_types import ContractType
-from ethpm_types.source import Content, ContractSource
-from packaging.version import Version
-
-from ape.api.config import PluginConfig
-from ape.api.trace import TraceAPI
 from ape.exceptions import APINotImplementedError, ContractLogicError
-from ape.types.coverage import ContractSourceCoverage
-from ape.types.trace import SourceTraceback
-from ape.utils import (
-    BaseInterfaceModel,
-    abstractmethod,
-    log_instead_of_fail,
-    raises_not_implemented,
-)
+from ape.utils.basemodel import BaseInterfaceModel
+from ape.utils.misc import log_instead_of_fail, raises_not_implemented
 
 if TYPE_CHECKING:
+    from eth_pydantic_types import HexBytes
+    from ethpm_types import ContractType
+    from ethpm_types.source import Content, ContractSource
+    from packaging.version import Version
+
+    from ape.api.config import PluginConfig
+    from ape.api.trace import TraceAPI
     from ape.managers.project import ProjectManager
+    from ape.types.coverage import ContractSourceCoverage
+    from ape.types.trace import SourceTraceback
 
 
 class CompilerAPI(BaseInterfaceModel):
@@ -47,7 +44,7 @@ class CompilerAPI(BaseInterfaceModel):
         The name of the compiler.
         """
 
-    def get_config(self, project: Optional["ProjectManager"] = None) -> PluginConfig:
+    def get_config(self, project: Optional["ProjectManager"] = None) -> "PluginConfig":
         """
         The combination of settings from ``ape-config.yaml`` and ``.compiler_settings``.
 
@@ -82,7 +79,7 @@ class CompilerAPI(BaseInterfaceModel):
         contract_filepaths: Iterable[Path],
         project: Optional["ProjectManager"] = None,
         **overrides,
-    ) -> dict[Version, dict]:
+    ) -> dict["Version", dict]:
         """
         Get a mapping of the settings that would be used to compile each of the sources
         by the compiler version number.
@@ -104,7 +101,7 @@ class CompilerAPI(BaseInterfaceModel):
         contract_filepaths: Iterable[Path],
         project: Optional["ProjectManager"],
         settings: Optional[dict] = None,
-    ) -> Iterator[ContractType]:
+    ) -> Iterator["ContractType"]:
         """
         Compile the given source files. All compiler plugins must implement this function.
 
@@ -126,7 +123,7 @@ class CompilerAPI(BaseInterfaceModel):
         project: Optional["ProjectManager"],
         settings: Optional[dict] = None,
         **kwargs,
-    ) -> ContractType:
+    ) -> "ContractType":
         """
         Compile a program.
 
@@ -165,7 +162,7 @@ class CompilerAPI(BaseInterfaceModel):
         self,
         contract_filepaths: Iterable[Path],
         project: Optional["ProjectManager"] = None,
-    ) -> dict[Version, set[Path]]:
+    ) -> dict["Version", set[Path]]:
         """
         Get a map of versions to source paths.
 
@@ -221,8 +218,8 @@ class CompilerAPI(BaseInterfaceModel):
 
     @raises_not_implemented
     def trace_source(  # type: ignore[empty-body]
-        self, contract_source: ContractSource, trace: TraceAPI, calldata: HexBytes
-    ) -> SourceTraceback:
+        self, contract_source: "ContractSource", trace: "TraceAPI", calldata: "HexBytes"
+    ) -> "SourceTraceback":
         """
         Get a source-traceback for the given contract type.
         The source traceback object contains all the control paths taken in the transaction.
@@ -242,7 +239,7 @@ class CompilerAPI(BaseInterfaceModel):
     @raises_not_implemented
     def flatten_contract(  # type: ignore[empty-body]
         self, path: Path, project: Optional["ProjectManager"] = None, **kwargs
-    ) -> Content:
+    ) -> "Content":
         """
         Get the content of a flattened contract via its source path.
         Plugin implementations handle import resolution, SPDX de-duplication,
@@ -262,7 +259,7 @@ class CompilerAPI(BaseInterfaceModel):
 
     @raises_not_implemented
     def init_coverage_profile(
-        self, source_coverage: ContractSourceCoverage, contract_source: ContractSource
+        self, source_coverage: "ContractSourceCoverage", contract_source: "ContractSource"
     ):  # type: ignore[empty-body]
         """
         Initialize an empty report for the given source ID. Modifies the given source

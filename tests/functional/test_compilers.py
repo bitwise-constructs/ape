@@ -7,8 +7,8 @@ from ethpm_types import ContractType, ErrorABI
 
 from ape.contracts import ContractContainer
 from ape.exceptions import APINotImplementedError, CompilerError, ContractLogicError, CustomError
-from ape.types import AddressType
-from ape_compile import Config
+from ape.types.address import AddressType
+from ape_compile.config import Config
 
 
 def test_get_imports(project, compilers):
@@ -77,7 +77,7 @@ def test_compile(compilers, project_with_contract, factory):
     Testing both stringified paths and path-object paths.
     """
     path = next(iter(project_with_contract.sources.paths))
-    actual = compilers.compile((factory(path),))
+    actual = compilers.compile((factory(path),), project=project_with_contract)
     contract_name = path.stem
     assert contract_name in [x.name for x in actual]
 
@@ -209,7 +209,7 @@ def test_enrich_error_custom_error(chain, compilers):
     err = ContractLogicError("0x6a12f104", contract_address=addr)
 
     # Hack in contract-type.
-    chain.contracts._local_contract_types[addr] = contract_type
+    chain.contracts.contract_types[addr] = contract_type
 
     # Enriching the error should produce a custom error from the ABI.
     actual = compilers.enrich_error(err)

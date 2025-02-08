@@ -18,8 +18,21 @@ def test_block(eth_tester_provider, vyper_contract_instance):
     assert actual.number == data["number"]
 
 
-def test_block_dict(block):
-    actual = block.model_dump()
+def test_repr(block):
+    actual = repr(block)
+    expected = f"<Block number={block.number} hash={to_hex(block.hash)}>"
+    assert actual == expected
+
+    # Show it works when there is no hash.
+    block.hash = None
+    actual = repr(block)
+    expected = f"<Block number={block.number}>"
+    assert actual == expected
+
+
+@pytest.mark.parametrize("mode", ("json", "python"))
+def test_model_dump(block, mode):
+    actual = block.model_dump(mode=mode)
     expected = {
         "baseFeePerGas": 1000000000,
         "difficulty": 0,
@@ -38,7 +51,7 @@ def test_block_dict(block):
     assert actual == expected
 
 
-def test_block_json(block):
+def test_model_dump_json(block):
     actual = block.model_dump_json()
     expected = (
         '{"baseFeePerGas":1000000000,"difficulty":0,"gasLimit":30029122,"gasUsed":0,'
@@ -46,9 +59,31 @@ def test_block_json(block):
         '"num_transactions":0,"number":0,'
         f'"parentHash":"{to_hex(block.parent_hash)}",'
         f'"size":{block.size},"timestamp":{block.timestamp},'
-        f'"totalDifficulty":0,"transactions":[],"uncles":[]}}'
+        '"totalDifficulty":0,"transactions":[],"uncles":[]}'
     )
     assert actual == expected
+
+
+@pytest.mark.parametrize("size", (123, HexBytes(123), to_hex(123)))
+def test_size(block, size):
+    block._size = size
+    dictionary_python = block.model_dump(mode="python")
+    dictionary_json = block.model_dump(mode="json")
+    jons_str = block.model_dump_json()
+    assert dictionary_python["size"] == 123
+    assert dictionary_json["size"] == 123
+    assert '"size":123' in jons_str
+
+    # Show the same when validated with size in the model.
+    data = block.model_dump()
+    data["size"] = size
+    new_block = Block.model_validate(data)
+    dictionary_python = new_block.model_dump(mode="python")
+    dictionary_json = new_block.model_dump(mode="json")
+    jons_str = new_block.model_dump_json()
+    assert dictionary_python["size"] == 123
+    assert dictionary_json["size"] == 123
+    assert '"size":123' in jons_str
 
 
 def test_block_calculate_size(block):
@@ -93,3 +128,14 @@ def test_model_validate_web3_block():
     data = BlockData(number=123, timestamp=123, gasLimit=123, gasUsed=100)  # type: ignore
     actual = Block.model_validate(data)
     assert actual.number == 123
+
+
+def test_transactions(block):
+    actual = block.transactions
+    expected: list = []
+    assert actual == expected
+
+    # Ensure still works when hash is None (was a bug where this crashed).
+    block.hash = None
+    block.__dict__.pop("transactions", None)  # Ensure not cached.
+    assert block.transactions == []

@@ -1,8 +1,10 @@
 from collections.abc import Iterator
+from functools import cached_property
 from types import ModuleType
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
-from ape.api import ReceiptAPI, TransactionAPI
+from ethpm_types import ContractType
+
 from ape.contracts.base import (
     ContractCallHandler,
     ContractInstance,
@@ -12,9 +14,8 @@ from ape.contracts.base import (
 )
 from ape.exceptions import ChainError, DecodingError
 from ape.logging import logger
-from ape.types import AddressType, ContractType, HexBytes
-from ape.utils import ManagerAccessMixin, cached_property
 from ape.utils.abi import MethodABI
+from ape.utils.basemodel import ManagerAccessMixin
 
 from .constants import (
     MULTICALL3_ADDRESS,
@@ -24,11 +25,17 @@ from .constants import (
 )
 from .exceptions import InvalidOption, UnsupportedChainError, ValueRequired
 
+if TYPE_CHECKING:
+    from eth_pydantic_types import HexBytes
+
+    from ape.api.transactions import ReceiptAPI, TransactionAPI
+    from ape.types.address import AddressType
+
 
 class BaseMulticall(ManagerAccessMixin):
     def __init__(
         self,
-        address: AddressType = MULTICALL3_ADDRESS,
+        address: "AddressType" = MULTICALL3_ADDRESS,
         supported_chains: Optional[list[int]] = None,
     ) -> None:
         """
@@ -155,13 +162,13 @@ class Call(BaseMulticall):
 
     def __init__(
         self,
-        address: AddressType = MULTICALL3_ADDRESS,
+        address: "AddressType" = MULTICALL3_ADDRESS,
         supported_chains: Optional[list[int]] = None,
     ) -> None:
         super().__init__(address=address, supported_chains=supported_chains)
 
         self.abis: list[MethodABI] = []
-        self._result: Union[None, list[tuple[bool, HexBytes]]] = None
+        self._result: Union[None, list[tuple[bool, "HexBytes"]]] = None
 
     @property
     def handler(self) -> ContractCallHandler:  # type: ignore[override]
@@ -176,7 +183,7 @@ class Call(BaseMulticall):
         return self
 
     @property
-    def returnData(self) -> list[HexBytes]:
+    def returnData(self) -> list["HexBytes"]:
         # NOTE: this property is kept camelCase to align with the raw EVM struct
         result = self._result  # Declare for typing reasons.
         return [res.returnData if res.success else None for res in result]  # type: ignore
@@ -221,7 +228,7 @@ class Call(BaseMulticall):
         self._result = self.handler(self.calls, **call_kwargs)
         return self._decode_results()
 
-    def as_transaction(self, **txn_kwargs) -> TransactionAPI:
+    def as_transaction(self, **txn_kwargs) -> "TransactionAPI":
         """
         Encode the Multicall transaction as a ``TransactionAPI`` object, but do not execute it.
 
@@ -268,7 +275,7 @@ class Transaction(BaseMulticall):
 
         # NOTE: Won't fail if `value` is provided otherwise (won't do anything either)
 
-    def __call__(self, **txn_kwargs) -> ReceiptAPI:
+    def __call__(self, **txn_kwargs) -> "ReceiptAPI":
         """
         Execute the Multicall transaction. The transaction will broadcast again every time
         the ``Transaction`` object is called.
@@ -286,7 +293,7 @@ class Transaction(BaseMulticall):
         self._validate_calls(**txn_kwargs)
         return self.handler(self.calls, **txn_kwargs)
 
-    def as_transaction(self, **txn_kwargs) -> TransactionAPI:
+    def as_transaction(self, **txn_kwargs) -> "TransactionAPI":
         """
         Encode the Multicall transaction as a ``TransactionAPI`` object, but do not execute it.
 

@@ -1,17 +1,17 @@
 import sys
 import time
+from abc import abstractmethod
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime as datetime_type
+from functools import cached_property
 from typing import IO, TYPE_CHECKING, Any, NoReturn, Optional, Union
 
 from eth_pydantic_types import HexBytes, HexStr
 from eth_utils import is_hex, to_hex, to_int
-from ethpm_types.abi import EventABI, MethodABI
 from pydantic import ConfigDict, field_validator
 from pydantic.fields import Field
 from tqdm import tqdm  # type: ignore
 
-from ape.api.explorers import ExplorerAPI
 from ape.exceptions import (
     NetworkError,
     ProviderNotConnectedError,
@@ -20,28 +20,22 @@ from ape.exceptions import (
     TransactionNotFoundError,
 )
 from ape.logging import logger
-from ape.types import (
-    AddressType,
-    AutoGasLimit,
-    ContractLogContainer,
-    HexInt,
-    SourceTraceback,
-    TransactionSignature,
-)
-from ape.utils import (
-    BaseInterfaceModel,
-    ExtraAttributesMixin,
-    ExtraModelAttributes,
-    abstractmethod,
-    cached_property,
-    log_instead_of_fail,
-    raises_not_implemented,
-)
+from ape.types.address import AddressType
+from ape.types.basic import HexInt
+from ape.types.gas import AutoGasLimit
+from ape.types.signatures import TransactionSignature
+from ape.utils.basemodel import BaseInterfaceModel, ExtraAttributesMixin, ExtraModelAttributes
+from ape.utils.misc import log_instead_of_fail, raises_not_implemented
 
 if TYPE_CHECKING:
+    from ethpm_types.abi import EventABI, MethodABI
+
+    from ape.api.explorers import ExplorerAPI
     from ape.api.providers import BlockAPI
     from ape.api.trace import TraceAPI
     from ape.contracts import ContractEvent
+    from ape.types.events import ContractLogContainer
+    from ape.types.trace import SourceTraceback
 
 
 class TransactionAPI(BaseInterfaceModel):
@@ -79,7 +73,7 @@ class TransactionAPI(BaseInterfaceModel):
     @classmethod
     def validate_gas_limit(cls, value):
         if value is None:
-            if not cls.network_manager.active_provider:
+            if not cls.network_manager.connected:
                 raise NetworkError("Must be connected to use default gas config.")
 
             value = cls.network_manager.active_provider.network.gas_limit
@@ -88,7 +82,7 @@ class TransactionAPI(BaseInterfaceModel):
             return None  # Delegate to `ProviderAPI.estimate_gas_cost`
 
         elif value == "max":
-            if not cls.network_manager.active_provider:
+            if not cls.network_manager.connected:
                 raise NetworkError("Must be connected to use 'max'.")
 
             return cls.network_manager.active_provider.max_gas
@@ -102,7 +96,18 @@ class TransactionAPI(BaseInterfaceModel):
         return value
 
     @property
+    def gas(self) -> Optional[int]:
+        """
+        Alias for ``.gas_limit``.
+        """
+        return self.gas_limit
+
+    @property
     def raise_on_revert(self) -> bool:
+        """
+        ``True`` means VM-reverts should raise exceptions.
+        ``False`` allows getting failed receipts.
+        """
         return self._raise_on_revert
 
     @raise_on_revert.setter
@@ -127,6 +132,14 @@ class TransactionAPI(BaseInterfaceModel):
         """
         The calculated hash of the transaction.
         """
+
+    # TODO: In 0.9, simply rename txn_hash to hash.
+    @property
+    def hash(self) -> HexBytes:
+        """
+        Alias for ``self.txn_hash``.
+        """
+        return self.txn_hash
 
     @property
     def receipt(self) -> Optional["ReceiptAPI"]:
@@ -351,7 +364,7 @@ class ReceiptAPI(ExtraAttributesMixin, BaseInterfaceModel):
             same amount of gas as the given ``gas_limit``.
         """
 
-    @property
+    @cached_property
     def trace(self) -> "TraceAPI":
         """
         The :class:`~ape.api.trace.TraceAPI` of the transaction.
@@ -359,7 +372,7 @@ class ReceiptAPI(ExtraAttributesMixin, BaseInterfaceModel):
         return self.provider.get_transaction_trace(self.txn_hash)
 
     @property
-    def _explorer(self) -> Optional[ExplorerAPI]:
+    def _explorer(self) -> Optional["ExplorerAPI"]:
         return self.provider.network.explorer
 
     @property
@@ -384,11 +397,11 @@ class ReceiptAPI(ExtraAttributesMixin, BaseInterfaceModel):
         return self.block.timestamp
 
     @property
-    def datetime(self) -> datetime:
+    def datetime(self) -> "datetime_type":
         return self.block.datetime
 
     @cached_property
-    def events(self) -> ContractLogContainer:
+    def events(self) -> "ContractLogContainer":
         """
         All the events that were emitted from this call.
         """
@@ -399,9 +412,9 @@ class ReceiptAPI(ExtraAttributesMixin, BaseInterfaceModel):
     def decode_logs(
         self,
         abi: Optional[
-            Union[list[Union[EventABI, "ContractEvent"]], Union[EventABI, "ContractEvent"]]
+            Union[list[Union["EventABI", "ContractEvent"]], Union["EventABI", "ContractEvent"]]
         ] = None,
-    ) -> ContractLogContainer:
+    ) -> "ContractLogContainer":
         """
         Decode the logs on the receipt.
 
@@ -489,13 +502,13 @@ class ReceiptAPI(ExtraAttributesMixin, BaseInterfaceModel):
                 time.sleep(time_to_sleep)
 
     @property
-    def method_called(self) -> Optional[MethodABI]:
+    def method_called(self) -> Optional["MethodABI"]:
         """
         The method ABI of the method called to produce this receipt.
         """
         return None
 
-    @property
+    @cached_property
     def return_value(self) -> Any:
         """
         Obtain the final return value of the call. Requires tracing to function,
@@ -509,7 +522,7 @@ class ReceiptAPI(ExtraAttributesMixin, BaseInterfaceModel):
 
     @property
     @raises_not_implemented
-    def source_traceback(self) -> SourceTraceback:  # type: ignore[empty-body]
+    def source_traceback(self) -> "SourceTraceback":  # type: ignore[empty-body]
         """
         A Pythonic style traceback for both failing and non-failing receipts.
         Requires a provider that implements

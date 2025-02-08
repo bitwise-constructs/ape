@@ -1,7 +1,7 @@
 import sys
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import IO, Any, Optional, Union
+from typing import IO, TYPE_CHECKING, Any, Optional, Union
 
 from eth_abi import decode
 from eth_account import Account as EthAccount
@@ -11,17 +11,23 @@ from eth_account._utils.legacy_transactions import (
 )
 from eth_pydantic_types import HexBytes
 from eth_utils import decode_hex, encode_hex, keccak, to_hex, to_int
-from ethpm_types import ContractType
 from ethpm_types.abi import EventABI, MethodABI
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from ape.api import ReceiptAPI, TransactionAPI
-from ape.contracts import ContractEvent
+from ape.api.transactions import ReceiptAPI, TransactionAPI
 from ape.exceptions import OutOfGasError, SignatureError, TransactionError
 from ape.logging import logger
-from ape.types import AddressType, ContractLog, ContractLogContainer, HexInt, SourceTraceback
-from ape.utils import ZERO_ADDRESS
+from ape.types.address import AddressType
+from ape.types.basic import HexInt
+from ape.types.events import ContractLog, ContractLogContainer
+from ape.types.trace import SourceTraceback
+from ape.utils.misc import ZERO_ADDRESS
 from ape_ethereum.trace import Trace, _events_to_trees
+
+if TYPE_CHECKING:
+    from ethpm_types import ContractType
+
+    from ape.contracts import ContractEvent
 
 
 class TransactionStatusEnum(IntEnum):
@@ -106,6 +112,8 @@ class BaseTransaction(TransactionAPI):
 
         return signed_txn
 
+    # TODO: In 0.9, either use hex-str or hex-bytes between both this
+    #   and ReceiptAPI (make consistent).
     @property
     def txn_hash(self) -> HexBytes:
         txn_bytes = self.serialize_transaction()
@@ -218,7 +226,7 @@ class Receipt(ReceiptAPI):
         return list(trace.debug_logs)
 
     @cached_property
-    def contract_type(self) -> Optional[ContractType]:
+    def contract_type(self) -> Optional["ContractType"]:
         if address := (self.receiver or self.contract_address):
             return self.chain_manager.contracts.get(address)
 
@@ -308,7 +316,9 @@ class Receipt(ReceiptAPI):
             contract_types = self.chain_manager.contracts.get_multiple(addresses)
             # address → selector → abi
             selectors = {
-                address: {encode_hex(keccak(text=abi.selector)): abi for abi in contract.events}
+                address.lower(): {
+                    encode_hex(keccak(text=abi.selector)): abi for abi in contract.events
+                }
                 for address, contract in contract_types.items()
             }
 
@@ -333,10 +343,11 @@ class Receipt(ReceiptAPI):
             decoded_logs: ContractLogContainer = ContractLogContainer()
             for log in self.logs:
                 if contract_address := log.get("address"):
-                    if contract_address in selectors and (topics := log.get("topics")):
+                    lower_address = contract_address.lower()
+                    if lower_address in selectors and (topics := log.get("topics")):
                         selector = encode_hex(topics[0])
-                        if selector in selectors[contract_address]:
-                            event_abi = selectors[contract_address][selector]
+                        if selector in selectors[lower_address]:
+                            event_abi = selectors[lower_address][selector]
                             decoded_logs.extend(
                                 self.provider.network.ecosystem.decode_logs([log], event_abi)
                             )

@@ -4,7 +4,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from enum import Enum
 from functools import cached_property
 from shutil import which
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlparse
 
 import click
@@ -14,11 +14,13 @@ from pydantic import field_validator, model_validator
 
 from ape.exceptions import PluginVersionError
 from ape.logging import logger
-from ape.utils import BaseInterfaceModel, get_package_version, log_instead_of_fail
 from ape.utils._github import github_client
-from ape.utils.basemodel import BaseModel
-from ape.utils.misc import _get_distributions
+from ape.utils.basemodel import BaseInterfaceModel, BaseModel
+from ape.utils.misc import _get_distributions, get_package_version, log_instead_of_fail
 from ape.version import version as ape_version_str
+
+if TYPE_CHECKING:
+    from ape.managers.plugins import PluginManager
 
 # Plugins maintained OSS by ApeWorX (and trusted)
 # Use `uv pip` if installed, otherwise `python -m pip`
@@ -37,6 +39,47 @@ CORE_PLUGINS = [
     "ape_pm",
     "ape_run",
     "ape_test",
+]
+# Hardcoded for performance reasons. Functionality in plugins commands
+# and functions won't use this; they use GitHub to check directly.
+# This hardcoded list is useful for `ape --help`. If ApeWorX adds a new
+# trusted plugin, it should be added to this list; else it will show
+# as 3rd-party in `ape --help`.
+TRUSTED_PLUGINS = [
+    "addressbook",
+    "alchemy",
+    "arbitrum",
+    "avalanche",
+    "aws",
+    "base",
+    "blast",
+    "blockscout",
+    "bsc",
+    "cairo",
+    "chainstack",
+    "ens",
+    "etherscan",
+    "fantom",
+    "farcaster",
+    "flashbots",
+    "foundry",
+    "frame",
+    "ganache",
+    "hardhat",
+    "infura",
+    "ledger",
+    "notebook",
+    "optimism",
+    "polygon",
+    "polygon_zkevm",
+    "safe",
+    "solidity",
+    "template",
+    "tenderly",
+    "titanoboa",
+    "tokens",
+    "trezor",
+    "vyper",
 ]
 
 
@@ -162,7 +205,7 @@ class PluginMetadataList(BaseModel):
     third_party: "PluginGroup"
 
     @classmethod
-    def load(cls, plugin_manager, include_available: bool = True):
+    def load(cls, plugin_manager: "PluginManager", include_available: bool = True):
         plugins = plugin_manager.registered_plugins
         if include_available:
             plugins = plugins.union(github_client.available_plugins)
@@ -215,7 +258,7 @@ class PluginMetadataList(BaseModel):
         yield from self.installed.plugins.values()
         yield from self.third_party.plugins.values()
 
-    def get_plugin(self, name: str) -> Optional["PluginMetadata"]:
+    def get_plugin(self, name: str, check_available: bool = True) -> Optional["PluginMetadata"]:
         name = name if name.startswith("ape_") else f"ape_{name}"
         if name in self.core.plugins:
             return self.core.plugins[name]
@@ -223,7 +266,7 @@ class PluginMetadataList(BaseModel):
             return self.installed.plugins[name]
         elif name in self.third_party.plugins:
             return self.third_party.plugins[name]
-        elif name in self.available.plugins:
+        elif check_available and name in self.available.plugins:
             return self.available.plugins[name]
 
         return None
@@ -379,17 +422,26 @@ class PluginMetadata(BaseInterfaceModel):
 
     @property
     def is_third_party(self) -> bool:
-        return self.is_installed and not self.is_available
+        """
+        ``True`` when is an installed plugin that is not from ApeWorX.
+        """
+        return self.is_installed and not self.is_trusted
+
+    @cached_property
+    def is_trusted(self) -> bool:
+        """
+        ``True`` when is a plugin from ApeWorX.
+        """
+        return self.check_trusted()
 
     @property
     def is_available(self) -> bool:
         """
         Whether the plugin is maintained by the ApeWorX organization.
         """
-
         return self.module_name in _get_available_plugins()
 
-    def __str__(self):
+    def __str__(self) -> str:
         """
         A string like ``trezor==0.4.0``.
         """
@@ -404,6 +456,15 @@ class PluginMetadata(BaseInterfaceModel):
             _get_distributions.cache_clear()
 
         return any(n == self.package_name for n in get_plugin_dists())
+
+    def check_trusted(self, use_web: bool = True) -> bool:
+        if use_web:
+            return self.is_available
+
+        else:
+            # Sometimes (such as for --help commands), it is better
+            # to not check GitHub to see if the plugin is trusted.
+            return self.name in TRUSTED_PLUGINS
 
     def _prepare_install(
         self, upgrade: bool = False, skip_confirmation: bool = False

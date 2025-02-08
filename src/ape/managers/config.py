@@ -3,13 +3,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Optional
-
-from ethpm_types import PackageManifest
+from typing import TYPE_CHECKING, Any, Optional
 
 from ape.api.config import ApeConfig
 from ape.managers.base import BaseManager
-from ape.utils import create_tempdir, in_tempdir, log_instead_of_fail
 from ape.utils.basemodel import (
     ExtraAttributesMixin,
     ExtraModelAttributes,
@@ -17,7 +14,13 @@ from ape.utils.basemodel import (
     get_item_with_extras,
     only_raise_attribute_error,
 )
-from ape.utils.rpc import RPCHeaders
+from ape.utils.misc import log_instead_of_fail
+from ape.utils.os import create_tempdir, in_tempdir
+from ape.utils.rpc import USER_AGENT, RPCHeaders
+
+if TYPE_CHECKING:
+    from ethpm_types import PackageManifest
+
 
 CONFIG_FILE_NAME = "ape-config.yaml"
 
@@ -36,6 +39,10 @@ class ConfigManager(ExtraAttributesMixin, BaseManager):
         else:
             self.DATA_FOLDER = data_folder or Path.home() / ".ape"
 
+        request_header = request_header or {
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+        }
         self.REQUEST_HEADER = request_header or {}
 
     def __ape_extra_attributes__(self):
@@ -92,7 +99,7 @@ class ConfigManager(ExtraAttributesMixin, BaseManager):
         return ApeConfig.model_validate(merged_data)
 
     @classmethod
-    def extract_config(cls, manifest: PackageManifest, **overrides) -> ApeConfig:
+    def extract_config(cls, manifest: "PackageManifest", **overrides) -> ApeConfig:
         """
         Calculate the ape-config data from a package manifest.
 

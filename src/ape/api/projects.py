@@ -1,3 +1,4 @@
+from abc import abstractmethod
 from functools import cached_property
 from pathlib import Path
 from typing import Optional
@@ -5,7 +6,7 @@ from typing import Optional
 from pydantic import Field, field_validator
 
 from ape.api.config import ApeConfig
-from ape.utils import BaseInterfaceModel, abstractmethod
+from ape.utils.basemodel import BaseInterfaceModel
 
 
 class DependencyAPI(BaseInterfaceModel):
@@ -28,7 +29,7 @@ class DependencyAPI(BaseInterfaceModel):
     def package_id(self) -> str:
         """
         The full name of the package, used for storage.
-        Example: ``OpenZeppelin/openzepplin-contracts``.
+        Example: ``OpenZeppelin/openzeppelin-contracts``.
         """
 
     @property
@@ -125,13 +126,25 @@ class ApeProject(ProjectAPI):
 
     @cached_property
     def config_file(self) -> Path:
+        if self._using_pyproject_toml:
+            return self._pyproject_toml
+
+        # else: check for an ape-config file.
         for ext in self.EXTENSIONS:
             path = self.path / f"{self.CONFIG_FILE_NAME}{ext}"
             if path.is_file():
                 return path
 
-        # Default
+        # Default: non-existing ape-config.yaml file.
         return self.path / f"{self.CONFIG_FILE_NAME}.yaml"
+
+    @property
+    def _pyproject_toml(self) -> Path:
+        return self.path / "pyproject.toml"
+
+    @property
+    def _using_pyproject_toml(self) -> bool:
+        return self._pyproject_toml.is_file() and "[tool.ape" in self._pyproject_toml.read_text()
 
     def extract_config(self, **overrides) -> ApeConfig:
         return ApeConfig.validate_file(self.config_file, **overrides)

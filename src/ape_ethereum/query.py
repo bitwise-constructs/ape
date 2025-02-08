@@ -4,7 +4,7 @@ from typing import Optional
 
 from ape.api.query import ContractCreation, ContractCreationQuery, QueryAPI, QueryType
 from ape.exceptions import APINotImplementedError, ProviderError, QueryEngineError
-from ape.types import AddressType
+from ape.types.address import AddressType
 
 
 class EthereumQueryProvider(QueryAPI):
@@ -39,7 +39,7 @@ class EthereumQueryProvider(QueryAPI):
         Find when a contract was deployed using binary search and block tracing.
         """
         # skip the search if there is still no code at address at head
-        if not self.provider.get_code(query.contract):
+        if not self.chain_manager.get_code(query.contract):
             return None
 
         def find_creation_block(lo, hi):
@@ -47,13 +47,13 @@ class EthereumQueryProvider(QueryAPI):
             # takes log2(height), doesn't work with contracts that have been reinit.
             while hi - lo > 1:
                 mid = (lo + hi) // 2
-                code = self.provider.get_code(query.contract, block_id=mid)
+                code = self.chain_manager.get_code(query.contract, block_id=mid)
                 if not code:
                     lo = mid
                 else:
                     hi = mid
 
-            if self.provider.get_code(query.contract, block_id=hi):
+            if self.chain_manager.get_code(query.contract, block_id=hi):
                 return hi
 
             return None

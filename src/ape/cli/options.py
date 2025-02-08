@@ -1,14 +1,13 @@
 import inspect
+import sys
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import NoReturn, Optional, Union
+from typing import TYPE_CHECKING, Any, NoReturn, Optional, Union
 
 import click
 from click import Option
-from ethpm_types import ContractType
 
-from ape.api.providers import ProviderAPI
 from ape.cli.choices import (
     _ACCOUNT_TYPE_FILTER,
     _NONE_NETWORK,
@@ -21,12 +20,14 @@ from ape.cli.commands import ConnectedProviderCommand
 from ape.cli.paramtype import JSON, Noop
 from ape.exceptions import Abort, ProjectError
 from ape.logging import DEFAULT_LOG_LEVEL, ApeLogger, LogLevel, logger
-from ape.utils.basemodel import ManagerAccessMixin
+
+if TYPE_CHECKING:
+    from ethpm_types.contract_type import ContractType
 
 _VERBOSITY_VALUES = ("--verbosity", "-v")
 
 
-class ApeCliContextObject(ManagerAccessMixin, dict):
+class ApeCliContextObject(dict):
     """
     A ``click`` context object class. Use via :meth:`~ape.cli.options.ape_cli_context()`.
     It provides common CLI utilities for ape, such as logging or
@@ -40,6 +41,14 @@ class ApeCliContextObject(ManagerAccessMixin, dict):
     def __repr__(self) -> str:
         # Customizing this because otherwise it uses `dict` repr, which is confusing.
         return f"<{self.__class__.__name__}>"
+
+    def __getattr__(self, item: str) -> Any:
+        try:
+            return self.__getattribute__(item)
+        except AttributeError:
+            from ape.utils.basemodel import ManagerAccessMixin
+
+            return getattr(ManagerAccessMixin, item)
 
     @staticmethod
     def abort(msg: str, base_error: Optional[Exception] = None) -> NoReturn:
@@ -61,7 +70,7 @@ class ApeCliContextObject(ManagerAccessMixin, dict):
 
 def verbosity_option(
     cli_logger: Optional[ApeLogger] = None,
-    default: Union[str, int, LogLevel] = DEFAULT_LOG_LEVEL,
+    default: Optional[Union[str, int, LogLevel]] = None,
     callback: Optional[Callable] = None,
     **kwargs,
 ) -> Callable:
@@ -80,6 +89,7 @@ def verbosity_option(
         click option
     """
     _logger = cli_logger or logger
+    default = logger.level if default is None else default
     kwarguments = _create_verbosity_kwargs(
         _logger=_logger, default=default, callback=callback, **kwargs
     )
@@ -88,26 +98,29 @@ def verbosity_option(
 
 def _create_verbosity_kwargs(
     _logger: Optional[ApeLogger] = None,
-    default: Union[str, int, LogLevel] = DEFAULT_LOG_LEVEL,
+    default: Optional[Union[str, int, LogLevel]] = None,
     callback: Optional[Callable] = None,
     **kwargs,
 ) -> dict:
-    cli_logger = _logger or logger
+    default = logger.level if default is None else default
+    ape_logger = _logger or logger
 
     def set_level(ctx, param, value):
         if isinstance(value, str):
             value = value.upper()
             if value.startswith("LOGLEVEL."):
                 value = value.split(".")[-1].strip()
+            elif value in ("DISABLE", "NONE"):
+                value = ape_logger.DISABLE_LEVEL
 
         if callback is not None:
             value = callback(ctx, param, value)
 
-        if cli_logger._did_parse_sys_argv:
+        if ape_logger._did_parse_sys_argv:
             # Changing mid-session somehow (tests?)
-            cli_logger.set_level(value)
+            ape_logger.set_level(value)
         else:
-            cli_logger._load_from_sys_argv(default=value)
+            ape_logger._load_from_sys_argv(default=value)
 
     level_names = [lvl.name for lvl in LogLevel]
     names_str = f"{', '.join(level_names[:-1])}, or {level_names[-1]}"
@@ -124,7 +137,7 @@ def _create_verbosity_kwargs(
 
 
 def ape_cli_context(
-    default_log_level: Union[str, int, LogLevel] = DEFAULT_LOG_LEVEL,
+    default_log_level: Optional[Union[str, int, LogLevel]] = None,
     obj_type: type = ApeCliContextObject,
 ) -> Callable:
     """
@@ -133,7 +146,7 @@ def ape_cli_context(
     such as logging or accessing managers.
 
     Args:
-        default_log_level (str | int | :class:`~ape.logging.LogLevel`): The log-level
+        default_log_level (str | int | :class:`~ape.logging.LogLevel` |  None): The log-level
           value to pass to :meth:`~ape.cli.options.verbosity_option`.
         obj_type (Type): The context object type. Defaults to
           :class:`~ape.cli.options.ApeCliContextObject`. Sub-class
@@ -144,6 +157,7 @@ def ape_cli_context(
     Returns:
         click option
     """
+    default_log_level = logger.level if default_log_level is None else default_log_level
 
     def decorator(f):
         f = verbosity_option(logger, default=default_log_level)(f)
@@ -164,12 +178,13 @@ class NetworkOption(Option):
         network = kwargs.pop("network", None)
         provider = kwargs.pop("provider", None)
         default = kwargs.pop("default", "auto")
-        base_type = kwargs.pop("base_type", ProviderAPI)
+
         callback = kwargs.pop("callback", None)
 
         # NOTE: If using network_option, this part is skipped
         #  because parsing happens earlier to handle advanced usage.
         if not kwargs.get("type"):
+            base_type = kwargs.pop("base_type", None)
             kwargs["type"] = NetworkChoice(
                 case_sensitive=False,
                 ecosystem=ecosystem,
@@ -192,6 +207,8 @@ class NetworkOption(Option):
             else:
                 # NOTE: Use a function as the default so it is calculated lazily
                 def fn():
+                    from ape.utils.basemodel import ManagerAccessMixin
+
                     return ManagerAccessMixin.network_manager.default_ecosystem.name
 
                 default = fn
@@ -241,13 +258,7 @@ def network_option(
     def decorator(f):
         # These are the available network object names you can request.
         network_object_names = ("ecosystem", "network", "provider")
-
-        # All kwargs in the defined @click.command().
-        command_signature = inspect.signature(f)
-        command_kwargs = [x.name for x in command_signature.parameters.values()]
-
-        # Any combination of ["ecosystem", "network", "provider"]
-        requested_network_objects = [x for x in command_kwargs if x in network_object_names]
+        requested_network_objects = _get_requested_networks(f, network_object_names)
 
         # When using network_option, handle parsing now so we can pass to
         # callback outside of command context.
@@ -255,54 +266,13 @@ def network_option(
 
         def callback(ctx, param, value):
             keep_as_choice_str = param.type.base_type is str
-            use_default = value is None and default == "auto"
-
-            if not keep_as_choice_str and use_default:
-                default_ecosystem = ManagerAccessMixin.network_manager.default_ecosystem
-                provider_obj = default_ecosystem.default_network.default_provider
-
-            elif value is None or keep_as_choice_str:
-                provider_obj = None
-
-            elif isinstance(value, ProviderAPI):
-                provider_obj = value
-
-            elif value == _NONE_NETWORK:
-                provider_obj = None
-
-            else:
-                network_ctx = ManagerAccessMixin.network_manager.parse_network_choice(value)
-                provider_obj = network_ctx._provider
+            try:
+                provider_obj = _get_provider(value, default, keep_as_choice_str)
+            except Exception as err:
+                raise click.BadOptionUsage("--network", str(err), ctx)
 
             if provider_obj:
-                choice_classes = {
-                    "ecosystem": provider_obj.network.ecosystem,
-                    "network": provider_obj.network,
-                    "provider": provider_obj,
-                }
-
-                # Set the actual values in the callback.
-                for item in requested_network_objects:
-                    instance = choice_classes[item]
-                    ctx.params[item] = instance
-
-                if isinstance(ctx.command, ConnectedProviderCommand):
-                    # Place all values, regardless of request in
-                    # the context. This helps the Ape CLI backend.
-                    if ctx.obj is None:
-                        # Happens when using commands that don't use the
-                        # Ape context or any context.
-                        ctx.obj = {}
-
-                    for choice, obj in choice_classes.items():
-                        try:
-                            ctx.obj[choice] = obj
-                        except Exception:
-                            # This would only happen if using an unusual context object.
-                            raise Abort(
-                                "Cannot use connected-provider command type(s) "
-                                "with non key-settable context object."
-                            )
+                _update_context_with_network(ctx, provider_obj, requested_network_objects)
 
             elif keep_as_choice_str:
                 # Add raw choice to object context.
@@ -315,27 +285,7 @@ def network_option(
 
             return value if user_callback is None else user_callback(ctx, param, value)
 
-        # Prevent argument errors but initializing callback to use None placeholders.
-        partial_kwargs: dict = {}
-        for arg_type in network_object_names:
-            if arg_type in requested_network_objects:
-                partial_kwargs[arg_type] = None
-
-        if partial_kwargs:
-            wrapped_f = partial(f, **partial_kwargs)
-
-            # NOTE: The following is needed for click internals.
-            wrapped_f.__name__ = f.__name__  # type: ignore[attr-defined]
-
-            # NOTE: The following is needed for sphinx internals.
-            wrapped_f.__doc__ = f.__doc__
-
-            # Add other click parameters.
-            if hasattr(f, "__click_params__"):
-                wrapped_f.__click_params__ = f.__click_params__  # type: ignore[attr-defined]
-        else:
-            # No network kwargs are used. No need for partial wrapper.
-            wrapped_f = f
+        wrapped_f = _wrap_network_function(network_object_names, requested_network_objects, f)
 
         # Use NetworkChoice option.
         kwargs["type"] = None
@@ -360,6 +310,96 @@ def network_option(
         )(wrapped_f)
 
     return decorator
+
+
+def _get_requested_networks(function, network_object_names):
+    command_signature = inspect.signature(function)
+    command_kwargs = [x.name for x in command_signature.parameters.values()]
+
+    # Any combination of ["ecosystem", "network", "provider"]
+    return [x for x in command_kwargs if x in network_object_names]
+
+
+def _update_context_with_network(ctx, provider, requested_network_objects):
+    choice_classes = {
+        "ecosystem": provider.network.ecosystem,
+        "network": provider.network,
+        "provider": provider,
+    }
+
+    # Set the actual values in the callback.
+    for item in requested_network_objects:
+        instance = choice_classes[item]
+        ctx.params[item] = instance
+
+    if isinstance(ctx.command, ConnectedProviderCommand):
+        # Place all values, regardless of request in
+        # the context. This helps the Ape CLI backend.
+        if ctx.obj is None:
+            # Happens when using commands that don't use the
+            # Ape context or any context.
+            ctx.obj = {}
+
+        for choice, obj in choice_classes.items():
+            try:
+                ctx.obj[choice] = obj
+            except Exception:
+                # This would only happen if using an unusual context object.
+                raise Abort(
+                    "Cannot use connected-provider command type(s) "
+                    "with non key-settable context object."
+                )
+
+
+def _get_provider(value, default, keep_as_choice_str):
+    from ape.api.providers import ProviderAPI
+    from ape.utils.basemodel import ManagerAccessMixin
+
+    use_default = value is None and default == "auto"
+
+    if not keep_as_choice_str and use_default:
+        default_ecosystem = ManagerAccessMixin.network_manager.default_ecosystem
+        return default_ecosystem.default_network.default_provider
+
+    elif value is None or keep_as_choice_str:
+        return None
+
+    elif isinstance(value, ProviderAPI):
+        return value
+
+    elif value == _NONE_NETWORK:
+        return None
+
+    else:
+        network_ctx = ManagerAccessMixin.network_manager.parse_network_choice(value)
+        return network_ctx._provider
+
+
+def _wrap_network_function(network_object_names, requested_network_objects, function):
+    # Prevent argument errors but initializing callback to use None placeholders.
+    partial_kwargs: dict = {}
+    for arg_type in network_object_names:
+        if arg_type in requested_network_objects:
+            partial_kwargs[arg_type] = None
+
+    if partial_kwargs:
+        wrapped_f = partial(function, **partial_kwargs)
+
+        # NOTE: The following is needed for click internals.
+        wrapped_f.__name__ = function.__name__  # type: ignore[attr-defined]
+
+        # NOTE: The following is needed for sphinx internals.
+        wrapped_f.__doc__ = function.__doc__
+
+        # Add other click parameters.
+        if hasattr(function, "__click_params__"):
+            wrapped_f.__click_params__ = function.__click_params__  # type: ignore[attr-defined]
+
+        return wrapped_f
+
+    else:
+        # No network kwargs are used. No need for partial wrapper.
+        return function
 
 
 def skip_confirmation_option(help="") -> Callable:
@@ -400,9 +440,11 @@ def account_option(account_type: _ACCOUNT_TYPE_FILTER = None) -> Callable:
     )
 
 
-def _load_contracts(ctx, param, value) -> Optional[Union[ContractType, list[ContractType]]]:
+def _load_contracts(ctx, param, value) -> Optional[Union["ContractType", list["ContractType"]]]:
     if not value:
         return None
+
+    from ape.utils.basemodel import ManagerAccessMixin
 
     if len(ManagerAccessMixin.local_project.contracts) == 0:
         raise ProjectError("Project has no contracts.")
@@ -411,7 +453,7 @@ def _load_contracts(ctx, param, value) -> Optional[Union[ContractType, list[Cont
     # and therefore we should also return a list.
     is_multiple = isinstance(value, (tuple, list))
 
-    def get_contract(contract_name: str) -> ContractType:
+    def get_contract(contract_name: str) -> "ContractType":
         if contract_name not in ManagerAccessMixin.local_project.contracts:
             raise ProjectError(f"No contract named '{value}'")
 
@@ -491,7 +533,18 @@ def incompatible_with(incompatible_opts) -> type[click.Option]:
     return IncompatibleOption
 
 
+def _project_path_callback(ctx, param, val):
+    return Path(val) if val else Path.cwd()
+
+
 def _project_callback(ctx, param, val):
+    if "--help" in sys.argv or "-h" in sys.argv:
+        # Perf: project option is eager; have to check sys.argv to
+        #  know to exit early when only doing --help.
+        return
+
+    from ape.utils.basemodel import ManagerAccessMixin
+
     pm = None
     if not val:
         pm = ManagerAccessMixin.local_project
@@ -516,10 +569,16 @@ def _project_callback(ctx, param, val):
 
 
 def project_option(**kwargs):
+    _type = kwargs.pop("type", None)
+    callback = (
+        _project_path_callback
+        if (isinstance(_type, type) and issubclass(_type, Path))
+        else _project_callback
+    )
     return click.option(
         "--project",
         help="The path to a local project or manifest",
-        callback=_project_callback,
+        callback=callback,
         metavar="PATH",
         is_eager=True,
         **kwargs,

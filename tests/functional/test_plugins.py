@@ -82,7 +82,7 @@ def package_names() -> set[str]:
 
 
 @pytest.fixture
-def plugin_metadata(package_names) -> PluginMetadataList:
+def plugin_metadata(package_names, plugin_test_env) -> PluginMetadataList:
     names = {x for x in package_names}
     names.remove("ape-installed")
     names.add(f"ape-installed==0.{ape_version.minor}.0")
@@ -338,9 +338,11 @@ class TestPluginGroup:
 def test_handle_upgrade_result_when_upgrading_to_same_version(ape_caplog, logger):
     plugin = PluginMetadata(name=THIRD_PARTY[0], version=f"0.{ape_version.minor}.0")
     handler = ModifyPluginResultHandler(plugin)
-    ape_caplog.set_levels(LogLevel.INFO)
-    handler.handle_upgrade_result(0, f"0.{ape_version.minor}.0")
-    assert f"'{THIRD_PARTY[0]}' already has version '0.{ape_version.minor}.0'" in ape_caplog.head
+    with ape_caplog.at_level(LogLevel.INFO):
+        handler.handle_upgrade_result(0, f"0.{ape_version.minor}.0")
+        assert (
+            f"'{THIRD_PARTY[0]}' already has version '0.{ape_version.minor}.0'" in ape_caplog.head
+        )
 
 
 class TestApeVersion:

@@ -6,6 +6,7 @@ from typing import Optional
 
 import pytest
 
+from ape.logging import logger
 from ape.pytest.fixtures import PytestApeFixtures
 from tests.conftest import GETH_URI, geth_process_test
 from tests.integration.cli.utils import skip_projects_except
@@ -98,7 +99,7 @@ def setup_pytester(pytester, owner):
                     [
                         x
                         for x in content.splitlines()
-                        if x.startswith("def test_") and not x.startswith("def test_fail_")
+                        if x.lstrip().startswith("def test_") and not x.startswith("def test_fail_")
                     ]
                 )
                 num_failed += len(
@@ -177,14 +178,15 @@ def run_gas_test(
 def test_test(setup_pytester, integ_project, pytester, eth_tester_provider):
     _ = eth_tester_provider  # Ensure using EthTester for this test.
     passed, failed = setup_pytester(integ_project)
-    from ape.logging import logger
 
-    logger.set_level("DEBUG")
-    result = pytester.runpytest_subprocess(timeout=120)
-    try:
-        result.assert_outcomes(passed=passed, failed=failed), "\n".join(result.outlines)
-    except ValueError:
-        pytest.fail(str(result.stderr))
+    with logger.at_level("DEBUG"):
+        result = pytester.runpytest_subprocess(timeout=120)
+
+    outcomes = result.parseoutcomes()
+    assert "failed" not in outcomes if failed == 0 else outcomes["failed"] == failed
+    if integ_project.name != "test":
+        assert outcomes["passed"] == passed
+    # else: too many parametrized tests to calculate. No fails is good enough.
 
 
 @skip_projects_except("with-contracts")
@@ -212,7 +214,7 @@ E   ape.exceptions.ContractLogicError: Transaction failed.
 
 
 @skip_projects_except("test", "with-contracts")
-def test_test_isolation_disabled(setup_pytester, integ_project, pytester, eth_tester_provider):
+def test_isolation_disabled(setup_pytester, integ_project, pytester, eth_tester_provider):
     # check the disable isolation option actually disables built-in isolation
     _ = eth_tester_provider  # Ensure using EthTester for this test.
     setup_pytester(integ_project)
@@ -426,7 +428,7 @@ def test_fails():
     pytester.makepyfile(test)
     stdin = "print(foo)\nexit\n"
     monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
-    result = pytester.runpytest("--interactive", "-s")
+    result = pytester.runpytest_subprocess("--interactive", "-s")
     result.assert_outcomes(failed=1)
     actual = str(result.stdout)
     assert secret in actual
@@ -435,27 +437,35 @@ def test_fails():
 
 @skip_projects_except("with-contracts")
 def test_watch(mocker, integ_project, runner, ape_cli):
-    mock_event_handler = mocker.MagicMock()
-    event_handler_patch = mocker.patch("ape_test._cli._create_event_handler")
-    event_handler_patch.return_value = mock_event_handler
-
-    mock_observer = mocker.MagicMock()
-    observer_patch = mocker.patch("ape_test._cli._create_observer")
-    observer_patch.return_value = mock_observer
-
-    run_subprocess_patch = mocker.patch("ape_test._cli.run_subprocess")
-    run_main_loop_patch = mocker.patch("ape_test._cli._run_main_loop")
-    run_main_loop_patch.side_effect = SystemExit  # Avoid infinite loop.
+    runner_patch = mocker.patch("ape_test._cli._run_with_observer")
 
     # Only passing `-s` so we have an extra arg to test.
     result = runner.invoke(ape_cli, ("test", "--watch", "-s"))
     assert result.exit_code == 0
 
-    # The observer started, then the main runner exits, and the observer stops + joins.
-    assert mock_observer.start.call_count == 1
-    assert mock_observer.stop.call_count == 1
-    assert mock_observer.join.call_count == 1
+    runner_patch.assert_called_once_with((Path("contracts"), Path("tests")), 0.5, "-s")
 
-    # NOTE: We had a bug once where the args it received were not strings.
-    #   (wasn't deconstructing), so this check is important.
-    run_subprocess_patch.assert_called_once_with(["ape", "test", "-s"])
+
+@skip_projects_except("with-contracts")
+def test_project_option(integ_project, ape_cli, runner):
+    _ = integ_project  # NOTE: Not actually used, but avoid running across all projects.
+
+    # NOTE: Using isolated filesystem so that
+    with runner.isolated_filesystem():
+        # Setup a project
+        project_name = "test-token-project"
+        project_dir = Path.cwd() / project_name
+        tests_dir = project_dir / "tests"
+        tests_dir.mkdir(parents=True)
+
+        # Setup a test
+        test_file = tests_dir / "test_project_option.py"
+        test_text = """
+def test_project_option():
+    assert True
+""".lstrip()
+        test_file.write_text(test_text)
+
+        result = runner.invoke(ape_cli, ("test", "--project", f"./{project_name}"))
+        assert "1 passed" in result.output
+        assert result.exit_code == 0

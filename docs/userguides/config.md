@@ -1,12 +1,12 @@
 # Configure Ape
 
-You can configure Ape using configuration files with the name `ape-config.yaml`.
-There are two locations you can place an `ape-config.yaml` file.
+You can configure Ape using a `pyproject.toml` file and the prefix `tool.ape` or any configuration file named `ape-config.[yaml|yml|json]`.
+There are two locations you can place config files.
 
 1. In the root of your project
 2. In your `$HOME/.ape` directory (global)
 
-Project settings take precedent, but global settings allow you to configure preferences across all projects, such as your default mainnet provider (e.g. Alchemy versus running your own node).
+Project settings take precedence, but global settings allow you to configure preferences across all projects, such as your default mainnet provider (e.g. Alchemy versus running your own node).
 
 This guide serves as an index of some settings you can include in any `ape-config.yaml` file.
 This guide is **PURPOSELY** alphabetized to facilitate easier look-up of keys.
@@ -23,6 +23,13 @@ However, here is a list of common-use cases requiring the `ape-config.yaml` file
 **Environment Variables**: `ape-config.yaml` files support environment-variable expansion.
 Simply include environment variables (with the `$` prefix) in your config file and Ape will automatically expand them.
 
+```toml
+[tool.ape.plugin]
+secret_rpc = "$MY_SECRET_RPC"
+```
+
+Or the equivalent YAML:
+
 ```yaml
 plugin:
   secret_rpc: $MY_SECRET_RPC
@@ -30,9 +37,58 @@ plugin:
 
 This helps keep your secrets out of Ape!
 
+Similarly, any config key-name can also be set with the same named environment variable (with a prefix).
+
+If a configuration is left unset (i.e., not included in the `ape-config.(yaml|json|toml)` file, Ape will inspect the environment variables as a fallback, following the pattern `APE_<PLUGIN?>_SETTING`, where different plugins define different prefixes.
+
+For example, the following config:
+
+```yaml
+contracts_folder: src/qwe
+test:
+  number_of_accounts: 3
+  show_internal: True
+compile:
+  exclude:
+    - "one"
+    - "two"
+    - "three"
+  include_dependencies: true
+```
+
+could be entirely defined with environment variables as follows:
+
+```shell
+APE_CONTRACTS_FOLDER=src/contracts
+APE_TEST_NUMBER_OF_ACCOUNTS=3
+APE_TEST_SHOW_INTERNAL=true
+APE_COMPILE_EXCLUDE='["one", "two", "three"]'
+APE_COMPILE_INCLUDE_DEPENDENCIES=true
+```
+
+Notice the `ape-compile` and `ape-test` plugin include their plugin name `APE_COMPILE` and `APE_TEST` respectively where `contracts_folder` only has the prefix `APE_` since it is not part of a plugin.
+
+Here is the complete list of supported prefixes that come with Ape out-of-the-box:
+
+| Module/Plugin | Prefix       |
+| ------------- | ------------ |
+| ape           | APE          |
+| ape_cache     | APE_CACHE    |
+| ape_compile   | APE_COMPILE  |
+| ape_console   | APE_CONSOLE  |
+| ape_ethereum  | APE_ETHEREUM |
+| ape_networks  | APE_NETWORKS |
+| ape_node      | APE_NODE     |
+| ape_test      | APE_TEST     |
+
+Each plugin outside the core package may define its own prefix, but the standard is `APE_PLUGINNAME_`.
+
+Using environment variables assists in keeping secrets out of your config files.
+However, the primary config should be file-driven and environment variables should only be used when necessary.
+
 ## Base Path
 
-Change the base path if it is different than your project root.
+Change the base path if it is different from your project root.
 For example, imagine a project structure like:
 
 ```
@@ -43,6 +99,13 @@ project
 ```
 
 In this case, you want to configure Ape like:
+
+```toml
+[tool.ape]
+base_path = "src"
+```
+
+Or the equivalent YAML:
 
 ```yaml
 base_path: src
@@ -55,6 +118,13 @@ Some dependencies, such as python-based ones like `snekmate`, use this structure
 
 Specify a different path to your `contracts/` directory.
 This is useful when using a different naming convention, such as `src/` rather than `contracts/`.
+
+```toml
+[tool.ape]
+contracts_folder = "src"
+```
+
+Or the equivalent YAML:
 
 ```yaml
 contracts_folder: src
@@ -71,6 +141,13 @@ contracts_folder: "~/GlobalContracts"
 
 You can change the default ecosystem by including the following:
 
+```toml
+[tool.ape]
+default_ecosystem = "fantom"
+```
+
+Or the equivalent YAML:
+
 ```yaml
 default_ecosystem: fantom
 ```
@@ -84,9 +161,18 @@ To learn more about dependencies, see [this guide](./dependencies.html).
 
 A simple example of configuring dependencies looks like this:
 
+```toml
+[[tool.ape.dependencies]]
+name = "openzeppelin"
+github = "OpenZeppelin/openzeppelin-contracts"
+version = "4.4.2"
+```
+
+Or the equivalent YAML:
+
 ```yaml
 dependencies:
-  - name: OpenZeppelin
+  - name: openzeppelin
     github: OpenZeppelin/openzeppelin-contracts
     version: 4.4.2
 ```
@@ -97,6 +183,18 @@ Set deployments that were made outside of Ape in your `ape-config.yaml` to creat
 (See [this example](./contracts.html#from-previous-deployment) for more information on this feature).
 
 Config example:
+
+```toml
+[[tool.ape.deployments.ethereum.mainnet]]
+contract_type = "MyContract"
+address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+
+[[tool.ape.deployments.ethereum.sepolia]]
+contract_type = "MyContract"
+address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+```
+
+Or the equivalent YAML:
 
 ```yaml
 deployments:
@@ -121,29 +219,41 @@ contract = project.MyContract.deployments[0]
 Ape does not add or edit deployments in your `ape-config.yaml` file.
 ```
 
-## Node
+## Name
 
-When using the `node` provider, you can customize its settings.
-For example, to change the URI for an Ethereum network, do:
+Configure the name of the project:
+
+```toml
+[tool.ape]
+name = "ape-project"
+```
+
+If the name is not specified in `tool.ape` but is in `project`, Ape will use that as the project name:
+
+```toml
+[project]
+name = "ape-project"
+```
+
+To configure this name using an `ape-config.yaml` file, do:
 
 ```yaml
-node:
-  ethereum:
-    mainnet:
-      uri: http://localhost:5030
+name: ape-project
 ```
-
-Now, the `ape-node` core plugin will use the URL `http://localhost:5030` to connect and make requests.
-
-```{warning}
-Instead of using `ape-node` to connect to an Infura or Alchemy node, use the [ape-infura](https://github.com/ApeWorX/ape-infura) or [ape-alchemy](https://github.com/ApeWorX/ape-alchemy) provider plugins instead, which have their own way of managing API keys via environment variables.
-```
-
-For more information on networking as a whole, see [this guide](./networks.html).
 
 ## Networks
 
 Set default network and network providers:
+
+```toml
+[tool.ape.ethereum]
+default_network = "mainnet-fork"
+
+[tool.ape.ethereum.mainnet_fork]
+default_provider = "hardhat"
+```
+
+Or the equivalent YAML:
 
 ```yaml
 ethereum:
@@ -180,6 +290,33 @@ ethereum:
 
 For the local network configuration, the default is `"max"`. Otherwise, it is `"auto"`.
 
+## Node
+
+When using the `node` provider, you can customize its settings.
+For example, to change the URI for an Ethereum network, do:
+
+```toml
+[tool.ape.node.ethereum.mainnet]
+uri = "http://localhost:5030"
+```
+
+Or the equivalent YAML:
+
+```yaml
+node:
+  ethereum:
+    mainnet:
+      uri: http://localhost:5030
+```
+
+Now, the `ape-node` core plugin will use the URL `http://localhost:5030` to connect and make requests.
+
+```{warning}
+Instead of using `ape-node` to connect to an Infura or Alchemy node, use the [ape-infura](https://github.com/ApeWorX/ape-infura) or [ape-alchemy](https://github.com/ApeWorX/ape-alchemy) provider plugins instead, which have their own way of managing API keys via environment variables.
+```
+
+For more information on networking as a whole, see [this guide](./networks.html).
+
 ## Plugins
 
 Set which `ape` plugins you want to always use.
@@ -187,6 +324,17 @@ Set which `ape` plugins you want to always use.
 ```{note}
 The `ape-` prefix is not needed and shouldn't be included here.
 ```
+
+```toml
+[[tool.ape.plugins]]
+name = "solidity"
+version = "0.1.0b2"
+
+[[tool.ape.plugins]]
+name = "ens"
+```
+
+Or the equivalent YAML:
 
 ```yaml
 plugins:

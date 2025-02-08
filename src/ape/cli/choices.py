@@ -1,39 +1,44 @@
 import re
 from collections.abc import Callable, Iterator, Sequence
 from enum import Enum
-from functools import lru_cache
-from typing import Any, Optional, Union
+from functools import cached_property, lru_cache
+from importlib import import_module
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import click
-from click import BadParameter, Choice, Context, Parameter
+from click import Choice, Context, Parameter
 
-from ape.api.accounts import AccountAPI
-from ape.api.providers import ProviderAPI
 from ape.exceptions import (
     AccountsError,
     EcosystemNotFoundError,
     NetworkNotFoundError,
     ProviderNotFoundError,
 )
-from ape.types import _LazySequence
-from ape.utils.basemodel import ManagerAccessMixin
+
+if TYPE_CHECKING:
+    from ape.api.accounts import AccountAPI
+    from ape.api.providers import ProviderAPI
 
 _ACCOUNT_TYPE_FILTER = Union[
-    None, Sequence[AccountAPI], type[AccountAPI], Callable[[AccountAPI], bool]
+    None, Sequence["AccountAPI"], type["AccountAPI"], Callable[["AccountAPI"], bool]
 ]
 
 
-def _get_accounts(key: _ACCOUNT_TYPE_FILTER) -> list[AccountAPI]:
+def _get_accounts(key: _ACCOUNT_TYPE_FILTER) -> list["AccountAPI"]:
+    from ape.utils.basemodel import ManagerAccessMixin as access
+
+    accounts = access.account_manager
+
     add_test_accounts = False
     if key is None:
-        account_list = list(ManagerAccessMixin.account_manager)
+        account_list = list(accounts)
 
         # Include test accounts at end.
         add_test_accounts = True
 
     elif isinstance(key, type):
         # Filtering by type.
-        account_list = ManagerAccessMixin.account_manager.get_accounts_by_type(key)
+        account_list = accounts.get_accounts_by_type(key)
 
     elif isinstance(key, (list, tuple, set)):
         # Given an account list.
@@ -41,11 +46,11 @@ def _get_accounts(key: _ACCOUNT_TYPE_FILTER) -> list[AccountAPI]:
 
     else:
         # Filtering by callable.
-        account_list = [a for a in ManagerAccessMixin.account_manager if key(a)]  # type: ignore
+        account_list = [a for a in accounts if key(a)]  # type: ignore
 
     sorted_accounts = sorted(account_list, key=lambda a: a.alias or "")
     if add_test_accounts:
-        sorted_accounts.extend(ManagerAccessMixin.account_manager.test_accounts)
+        sorted_accounts.extend(accounts.test_accounts)
 
     return sorted_accounts
 
@@ -64,7 +69,12 @@ class Alias(click.Choice):
         # NOTE: we purposely skip the constructor of `Choice`
         self.case_sensitive = False
         self._key_filter = key
-        self.choices = _LazySequence(self._choices_iterator)
+
+    @cached_property
+    def choices(self) -> Sequence:  # type: ignore[override]
+        from ape.types.basic import _LazySequence
+
+        return _LazySequence(self._choices_iterator)
 
     @property
     def _choices_iterator(self) -> Iterator[str]:
@@ -146,7 +156,7 @@ class PromptChoice(click.ParamType):
 
 def select_account(
     prompt_message: Optional[str] = None, key: _ACCOUNT_TYPE_FILTER = None
-) -> AccountAPI:
+) -> "AccountAPI":
     """
     Prompt the user to pick from their accounts and return that account.
     Use this method if you want to prompt users to select accounts _outside_
@@ -163,6 +173,7 @@ def select_account(
     Returns:
         :class:`~ape.api.accounts.AccountAPI`
     """
+    from ape.api.accounts import AccountAPI
 
     if key and isinstance(key, type) and not issubclass(key, AccountAPI):
         raise AccountsError(f"Cannot return accounts with type '{key}'.")
@@ -187,11 +198,16 @@ class AccountAliasPromptChoice(PromptChoice):
         self._key_filter = key
         self._prompt_message = prompt_message or "Select an account"
         self.name = name
-        self.choices = _LazySequence(self._choices_iterator)
+
+    @cached_property
+    def choices(self) -> Sequence[str]:  # type: ignore[override]
+        from ape.types.basic import _LazySequence
+
+        return _LazySequence(self._choices_iterator)
 
     def convert(
         self, value: Any, param: Optional[Parameter], ctx: Optional[Context]
-    ) -> Optional[AccountAPI]:
+    ) -> Optional["AccountAPI"]:
         if value is None:
             return None
 
@@ -200,23 +216,26 @@ class AccountAliasPromptChoice(PromptChoice):
         else:
             alias = value
 
+        from ape.utils.basemodel import ManagerAccessMixin as access
+
+        accounts = access.account_manager
         if isinstance(alias, str) and alias.upper().startswith("TEST::"):
             idx_str = alias.upper().replace("TEST::", "")
             if not idx_str.isnumeric():
-                if alias in ManagerAccessMixin.account_manager.aliases:
+                if alias in accounts.aliases:
                     # Was actually a similar-alias.
-                    return ManagerAccessMixin.account_manager.load(alias)
+                    return accounts.load(alias)
 
                 self.fail(f"Cannot reference test account by '{value}'.", param=param)
 
             account_idx = int(idx_str)
-            if 0 <= account_idx < len(ManagerAccessMixin.account_manager.test_accounts):
-                return ManagerAccessMixin.account_manager.test_accounts[int(idx_str)]
+            if 0 <= account_idx < len(accounts.test_accounts):
+                return accounts.test_accounts[int(idx_str)]
 
             self.fail(f"Index '{idx_str}' is not valid.", param=param)
 
-        elif alias and alias in ManagerAccessMixin.account_manager.aliases:
-            return ManagerAccessMixin.account_manager.load(alias)
+        elif alias and alias in accounts.aliases:
+            return accounts.load(alias)
 
         self.fail(f"Account with alias '{alias}' not found.", param=param)
 
@@ -228,7 +247,10 @@ class AccountAliasPromptChoice(PromptChoice):
                 click.echo(f"{idx}. {choice}")
                 did_print = True
 
-        len_test_accounts = len(ManagerAccessMixin.account_manager.test_accounts) - 1
+        from ape.utils.basemodel import ManagerAccessMixin as access
+
+        accounts = access.account_manager
+        len_test_accounts = len(accounts.test_accounts) - 1
         if len_test_accounts > 0:
             msg = "'TEST::account_idx', where `account_idx` is in [0..{len_test_accounts}]\n"
             if did_print:
@@ -246,22 +268,22 @@ class AccountAliasPromptChoice(PromptChoice):
             if account and (alias := account.alias):
                 yield alias
 
-    def select_account(self) -> AccountAPI:
+    def select_account(self) -> "AccountAPI":
         """
         Returns the selected account.
 
         Returns:
             :class:`~ape.api.accounts.AccountAPI`
         """
+        from ape.utils.basemodel import ManagerAccessMixin as access
 
+        accounts = access.account_manager
         if not self.choices or len(self.choices) == 0:
             raise AccountsError("No accounts found.")
         elif len(self.choices) == 1 and self.choices[0].startswith("TEST::"):
-            return ManagerAccessMixin.account_manager.test_accounts[
-                int(self.choices[0].replace("TEST::", ""))
-            ]
+            return accounts.test_accounts[int(self.choices[0].replace("TEST::", ""))]
         elif len(self.choices) == 1:
-            return ManagerAccessMixin.account_manager.load(self.choices[0])
+            return accounts.load(self.choices[0])
 
         self.print_choices()
         return click.prompt(self._prompt_message, type=self)
@@ -278,7 +300,7 @@ def get_networks(
     ecosystem: _NETWORK_FILTER = None,
     network: _NETWORK_FILTER = None,
     provider: _NETWORK_FILTER = None,
-) -> _LazySequence:
+) -> Sequence:
     # NOTE: Use str-keys and lru_cache.
     return _get_networks_sequence_from_cache(
         _network_filter_to_key(ecosystem),
@@ -289,8 +311,10 @@ def get_networks(
 
 @lru_cache(maxsize=None)
 def _get_networks_sequence_from_cache(ecosystem_key: str, network_key: str, provider_key: str):
-    return _LazySequence(
-        ManagerAccessMixin.network_manager.get_network_choices(
+    networks = import_module("ape.utils.basemodel").ManagerAccessMixin.network_manager
+    module = import_module("ape.types.basic")
+    return module._LazySequence(
+        networks.get_network_choices(
             ecosystem_filter=_key_to_network_filter(ecosystem_key),
             network_filter=_key_to_network_filter(network_key),
             provider_filter=_key_to_network_filter(provider_key),
@@ -336,76 +360,53 @@ class NetworkChoice(click.Choice):
         ecosystem: _NETWORK_FILTER = None,
         network: _NETWORK_FILTER = None,
         provider: _NETWORK_FILTER = None,
-        base_type: type = ProviderAPI,
+        base_type: Optional[Union[type, str]] = None,
         callback: Optional[Callable] = None,
     ):
-        if not issubclass(base_type, (ProviderAPI, str)):
-            raise TypeError(f"Unhandled type '{base_type}' for NetworkChoice.")
-
-        self.base_type = base_type
+        self._base_type = base_type
         self.callback = callback
-        networks = get_networks(ecosystem=ecosystem, network=network, provider=provider)
-        super().__init__(networks, case_sensitive)
+        self.case_sensitive = case_sensitive
+        self.ecosystem = ecosystem
+        self.network = network
+        self.provider = provider
+        # NOTE: Purposely avoid super().init for performance reasons.
+
+    @property
+    def base_type(self) -> Union[type["ProviderAPI"], str]:
+        if self._base_type is not None:
+            return self._base_type
+
+        # perf: Keep base-type as a forward-ref when only using the default.
+        #   so things load faster.
+        self._base_type = "ProviderAPI"
+        return self._base_type
+
+    @base_type.setter
+    def base_type(self, value):
+        self._base_type = value
+
+    @cached_property
+    def choices(self) -> Sequence[Any]:  # type: ignore[override]
+        return get_networks(ecosystem=self.ecosystem, network=self.network, provider=self.provider)
 
     def get_metavar(self, param):
         return "[ecosystem-name][:[network-name][:[provider-name]]]"
 
     def convert(self, value: Any, param: Optional[Parameter], ctx: Optional[Context]) -> Any:
-        choice: Optional[Union[str, ProviderAPI]]
-        networks = ManagerAccessMixin.network_manager
-        if not value:
-            choice = None
+        if not value or value.lower() in ("none", "null"):
+            return self.callback(ctx, param, _NONE_NETWORK) if self.callback else _NONE_NETWORK
 
-        elif value.lower() in ("none", "null"):
-            choice = _NONE_NETWORK
-
-        elif self.is_custom_value(value):
-            # By-pass choice constraints when using custom network.
-            choice = value
-
-        else:
-            # Regular conditions.
-            try:
-                # Validate result.
-                choice = super().convert(value, param, ctx)
-            except BadParameter:
-                # Attempt to get the provider anyway.
-                # Sometimes, depending on the provider, it'll still work.
-                # (as-is the case for custom-forked networks).
-                try:
-                    choice = networks.get_provider_from_choice(network_choice=value)
-
-                except (EcosystemNotFoundError, NetworkNotFoundError, ProviderNotFoundError) as err:
-                    # This error makes more sense, as it has attempted parsing.
-                    # Show this message as the BadParameter message.
-                    raise click.BadParameter(str(err)) from err
-
-                except Exception as err:
-                    # If an error was not raised for some reason, raise a simpler error.
-                    # NOTE: Still avoid showing the massive network options list.
-                    raise click.BadParameter(
-                        "Invalid network choice. Use `ape networks list` to see options."
-                    ) from err
-
-        if (
-            choice not in (None, _NONE_NETWORK)
-            and isinstance(choice, str)
-            and issubclass(self.base_type, ProviderAPI)
-        ):
+        if self.base_type == "ProviderAPI" or isinstance(self.base_type, type):
             # Return the provider.
-            choice = networks.get_provider_from_choice(network_choice=value)
+            from ape.utils.basemodel import ManagerAccessMixin as access
 
-        return self.callback(ctx, param, choice) if self.callback else choice
+            networks = access.network_manager
+            try:
+                value = networks.get_provider_from_choice(network_choice=value)
+            except (EcosystemNotFoundError, NetworkNotFoundError, ProviderNotFoundError) as err:
+                self.fail(str(err))
 
-    @classmethod
-    def is_custom_value(cls, value) -> bool:
-        return (
-            value is not None
-            and isinstance(value, str)
-            and cls.CUSTOM_NETWORK_PATTERN.match(value) is not None
-            or str(value).startswith("http://")
-            or str(value).startswith("https://")
-        )
+        return self.callback(ctx, param, value) if self.callback else value
 
 
 class OutputFormat(Enum):
@@ -438,3 +439,18 @@ def output_format_choice(options: Optional[list[OutputFormat]] = None) -> Choice
 
     # Uses `str` form of enum for CLI choices.
     return click.Choice([o.value for o in options], case_sensitive=False)
+
+
+class LazyChoice(Choice):
+    """
+    A simple lazy-choice where choices are evaluated lazily.
+    """
+
+    def __init__(self, get_choices: Callable[[], Sequence[str]], case_sensitive: bool = False):
+        self._get_choices = get_choices
+        self.case_sensitive = case_sensitive
+        # Note: Purposely avoid super init.
+
+    @cached_property
+    def choices(self) -> Sequence[str]:  # type: ignore[override]
+        return self._get_choices()

@@ -1,12 +1,15 @@
 import copy
 from pathlib import Path
+from typing import ClassVar
+from unittest import mock
 
 import pytest
 
 from ape.api.networks import ForkedNetworkAPI, NetworkAPI, create_network_type
 from ape.api.providers import ProviderAPI
 from ape.exceptions import NetworkError, ProviderNotFoundError
-from ape_ethereum import EthereumConfig
+from ape_ethereum import Ethereum, EthereumConfig
+from ape_ethereum.ecosystem import BaseEthereumConfig, NetworkConfig, create_network_config
 from ape_ethereum.transactions import TransactionType
 
 
@@ -204,11 +207,41 @@ def test_providers(ethereum):
     assert "node" in providers
 
 
+def test_providers_NAME_defined(mocker):
+    """
+    Show that when a provider plugin used the NAME ClassVar,
+    the provider's name is that instead of the plugin's name.
+    """
+    ecosystem_name = "my-ecosystem"
+    network_name = "my-network"
+    provider_name = "my-provider"
+
+    class MyProvider(ProviderAPI):
+        NAME: ClassVar[str] = provider_name
+
+    class MyNetwork(NetworkAPI):
+        def _get_plugin_providers(self):
+            yield "my-provider-plugin", (ecosystem_name, network_name, MyProvider)
+
+    class MyEcosystem(Ethereum):
+        pass
+
+    ecosystem = MyEcosystem(name=ecosystem_name)
+    network = MyNetwork(name=network_name, ecosystem=ecosystem)
+    actual = list(network.providers)
+    assert actual == [provider_name]  # And not "my-provider-plugin"
+
+
 def test_providers_custom_network(project, custom_networks_config_dict, ethereum):
     with project.temp_config(**custom_networks_config_dict):
         network = ethereum.apenet
         actual = network.providers
         assert "node" in actual
+        node = actual["node"]
+        # NOTE: There was a bug where sometimes it would use the GethDev class
+        #   and sometimes it would use the Node class. Node is what we want.
+        assert "Node" in repr(node.func)
+        assert "GethDev" not in repr(node.func)
 
 
 def test_providers_custom_non_fork_network_does_not_use_fork_provider(
@@ -260,3 +293,95 @@ def test_is_mainnet(ethereum):
     assert not ethereum.local.is_mainnet
     assert ethereum.mainnet.is_mainnet
     assert not ethereum.mainnet_fork.is_mainnet
+
+
+def test_is_mainnet_from_config(project):
+    """
+    Simulate an EVM plugin with a weird named mainnet that properly
+    configured it.
+    """
+    chain_id = 9191919191919919121177171
+    ecosystem_name = "ismainnettest"
+    network_name = "primarynetwork"
+    network_type = create_network_type(chain_id, chain_id)
+
+    class MyConfig(BaseEthereumConfig):
+        primarynetwork: NetworkConfig = create_network_config(is_mainnet=True)
+
+    class MyEcosystem(Ethereum):
+        name: str = ecosystem_name
+
+        @property
+        def config(self):
+            return MyConfig()
+
+    ecosystem = MyEcosystem()
+    network = network_type(name=network_name, ecosystem=ecosystem)
+    assert network.is_mainnet
+
+
+def test_explorer(networks):
+    """
+    Local network does not have an explorer, by default.
+    """
+    network = networks.ethereum.local
+    network.__dict__.pop("explorer", None)  # Ensure not cached yet.
+    assert network.explorer is None
+
+
+def test_explorer_when_network_registered(networks, mocker):
+    """
+    Tests the simple flow of having the Explorer plugin register
+    the networks it supports.
+    """
+    network = networks.ethereum.local
+    network.__dict__.pop("explorer", None)  # Ensure not cached yet.
+    name = "my-explorer"
+
+    def explorer_cls(*args, **kwargs):
+        res = mocker.MagicMock()
+        res.name = name
+        return res
+
+    mock_plugin_explorers = mocker.patch(
+        "ape.api.networks.NetworkAPI._plugin_explorers", new_callable=mock.PropertyMock
+    )
+    mock_plugin_explorers.return_value = [("my-example", ("ethereum", "local", explorer_cls))]
+    assert network.explorer is not None
+    assert network.explorer.name == name
+
+
+def test_explorer_when_adhoc_network_supported(networks, mocker):
+    """
+    Tests the flow of when a chain is supported by an explorer
+    but not registered in the plugin (API-flow).
+    """
+    network = networks.ethereum.local
+    network.__dict__.pop("explorer", None)  # Ensure not cached yet.
+    NAME = "my-explorer"
+
+    class MyExplorer:
+        name: str = NAME
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        @classmethod
+        def supports_chain(cls, chain_id):
+            return True
+
+    mock_plugin_explorers = mocker.patch(
+        "ape.api.networks.NetworkAPI._plugin_explorers", new_callable=mock.PropertyMock
+    )
+
+    # NOTE: Ethereum is not registered at the plugin level, but is at the API level.
+    mock_plugin_explorers.return_value = [
+        ("my-example", ("some-other-ecosystem", "local", MyExplorer))
+    ]
+    assert network.explorer is not None
+    assert network.explorer.name == NAME
+
+
+def test_evm_chains_auto_forked_networks_exist(networks):
+    # NOTE: Moonbeam networks exist in evmchains only; that is how Ape knows about them.
+    assert isinstance(networks.moonbeam.moonriver_fork, ForkedNetworkAPI)

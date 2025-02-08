@@ -8,7 +8,6 @@ import pytest
 from eth_utils import to_hex
 from ethpm_types import Compiler, ContractType, PackageManifest, Source
 from ethpm_types.manifest import PackageName
-from pydantic_core import Url
 
 import ape
 from ape import Project
@@ -17,7 +16,7 @@ from ape.contracts import ContractContainer
 from ape.exceptions import ConfigError, ProjectError
 from ape.logging import LogLevel
 from ape.utils import create_tempdir
-from ape_pm import BrownieProject, FoundryProject
+from ape_pm.project import BrownieProject, FoundryProject
 from tests.conftest import skip_if_plugin_installed
 
 
@@ -180,8 +179,9 @@ def test_isolate_in_tempdir(project):
 
 def test_isolate_in_tempdir_does_not_alter_sources(project):
     # First, create a bad source.
-    with project.temp_config(contracts_folder="tests"):
+    with project.temp_config(contracts_folder="build"):
         new_src = project.contracts_folder / "newsource.json"
+        new_src.parent.mkdir(exist_ok=True, parents=True)
         new_src.write_text("this is not json, oops")
         project.sources.refresh()  # Only need to be called when run with other tests.
 
@@ -194,8 +194,8 @@ def test_isolate_in_tempdir_does_not_alter_sources(project):
             project.sources.refresh()
 
         # Ensure "newsource" did not persist in the in-memory manifest.
-        assert "tests/newsource.json" in actual, project.path
-        assert "tests/newsource.json" not in (project.manifest.sources or {})
+        assert "build/newsource.json" in actual
+        assert "build/newsource.json" not in (project.manifest.sources or {})
 
 
 def test_in_tempdir(project, tmp_project):
@@ -209,8 +209,15 @@ def test_getattr(tmp_project):
 
 
 def test_getattr_not_exists(tmp_project):
-    with pytest.raises(AttributeError):
+    expected = (
+        r"'LocalProject' object has no attribute 'nope'\. Also checked extra\(s\) 'contracts'\."
+    )
+    with pytest.raises(AttributeError, match=expected) as err:
         _ = tmp_project.nope
+
+    # Was the case where the last entry was from Ape's basemodel stuff.
+    # Now, it points at the project manager last.
+    assert "ape/managers/project.py:" in repr(err.traceback[-1])
 
 
 def test_getattr_detects_changes(tmp_project):
@@ -298,13 +305,14 @@ def test_meta(project):
         assert project.meta.license == "MIT"
         assert project.meta.description == "Zoologist meme protocol"
         assert project.meta.keywords == ["Indiana", "Knight's Templar"]
-        assert project.meta.links == {"apeworx.io": Url("https://apeworx.io")}
+        assert len(project.meta.links) == 1
+        assert f"{project.meta.links['apeworx.io']}" == "https://apeworx.io/"
 
 
-def test_extract_manifest(tmp_project, mock_sepolia, vyper_contract_instance):
+def test_extract_manifest(tmp_project, vyper_contract_instance):
     contract_type = vyper_contract_instance.contract_type
     tmp_project.manifest.contract_types = {contract_type.name: contract_type}
-    tmp_project.deployments.track(vyper_contract_instance)
+    tmp_project.deployments.track(vyper_contract_instance, allow_dev=True)
 
     manifest = tmp_project.extract_manifest()
     assert type(manifest) is PackageManifest
@@ -666,10 +674,17 @@ class TestProject:
     def test_init(self, with_dependencies_project_path):
         # Purpose not using `project_with_contracts` fixture.
         project = Project(with_dependencies_project_path)
-        project.manifest_path.unlink(missing_ok=True)
-        assert project.path == with_dependencies_project_path
-        # Manifest should have been created by default.
-        assert not project.manifest_path.is_file()
+
+        # NOTE: Using tempdir to avoid clashing with other tests during x-dist.
+        with project.isolate_in_tempdir() as temp_project:
+            assert project.path == with_dependencies_project_path
+            project.manifest_path.unlink(missing_ok=True)
+
+            #  Re-init to show it doesn't create the manifest file.
+            project = Project(temp_project.path)
+
+            # Manifest should not have been created by default
+            assert not project.manifest_path.is_file()
 
     def test_init_invalid_config(self):
         here = os.curdir
@@ -680,9 +695,10 @@ class TestProject:
 
             os.chdir(temp_dir)
             expected = r"[.\n]*Input should be a valid string\n-->1: name:\n   2:   {asdf}[.\n]*"
+            weird_project = Project(temp_dir)
             try:
                 with pytest.raises(ConfigError, match=expected):
-                    _ = Project(temp_dir)
+                    _ = weird_project.path
             finally:
                 os.chdir(here)
 
@@ -890,7 +906,9 @@ class TestSourceManager:
 
             # Top-level match.
             for base in (source_path, str(source_path), "Contract", "Contract.json"):
-                assert pm.sources.lookup(base) == source_path, f"Failed to lookup {base}"
+                # Using stem in case it returns `Contract.__mock__`, which is
+                # added / removed as part of other tests (running x-dist).
+                assert pm.sources.lookup(base).stem == source_path.stem, f"Failed to lookup {base}"
 
             # Nested: 1st level
             for closest in (
@@ -901,6 +919,8 @@ class TestSourceManager:
             ):
                 actual = pm.sources.lookup(closest)
                 expected = nested_source_a
+                # Using stem in case it returns `Contract.__mock__`, which is
+                # added / removed as part of other tests (running x-dist).
                 assert actual.stem == expected.stem, f"Failed to lookup {closest}"
 
             # Nested: 2nd level
@@ -1014,20 +1034,20 @@ class TestContractManager:
 
 class TestDeploymentManager:
     @pytest.fixture
-    def project(self, tmp_project, vyper_contract_instance, mock_sepolia):
+    def project(self, tmp_project, vyper_contract_instance):
         contract_type = vyper_contract_instance.contract_type
         tmp_project.manifest.contract_types = {contract_type.name: contract_type}
         return tmp_project
 
-    def test_track(self, project, vyper_contract_instance, mock_sepolia):
-        project.deployments.track(vyper_contract_instance)
+    def test_track(self, project, vyper_contract_instance):
+        project.deployments.track(vyper_contract_instance, allow_dev=True)
         deployment = next(iter(project.deployments), None)
         contract_type = vyper_contract_instance.contract_type
         assert deployment is not None
         assert deployment.contract_type == f"{contract_type.source_id}:{contract_type.name}"
 
-    def test_instance_map(self, project, vyper_contract_instance, mock_sepolia):
-        project.deployments.track(vyper_contract_instance)
+    def test_instance_map(self, project, vyper_contract_instance):
+        project.deployments.track(vyper_contract_instance, allow_dev=True)
         assert project.deployments.instance_map != {}
 
         bip122_chain_id = to_hex(project.provider.get_block(0).hash)
@@ -1037,3 +1057,26 @@ class TestDeploymentManager:
                 return
 
         assert False, "Failed to find expected URI"
+
+
+def test_chdir(project):
+    original_path = project.path
+    with create_tempdir() as new_path:
+        project.chdir(new_path)
+        assert project.path == new_path
+
+    # Undo.
+    project.chdir(original_path)
+    assert project.path == original_path
+
+
+def test_within_project_path():
+    start_cwd = Path.cwd()
+    with create_tempdir() as new_path:
+        project = Project(new_path)
+        assert Path.cwd() != new_path
+
+        with project.within_project_path():
+            assert Path.cwd() == project.path
+
+    assert Path.cwd() == start_cwd

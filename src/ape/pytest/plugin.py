@@ -1,31 +1,7 @@
 import sys
 from pathlib import Path
-from typing import Optional
 
-from ape.api import EcosystemAPI
 from ape.exceptions import ConfigError
-from ape.pytest.config import ConfigWrapper
-from ape.pytest.coverage import CoverageTracker
-from ape.pytest.fixtures import PytestApeFixtures, ReceiptCapture
-from ape.pytest.gas import GasTracker
-from ape.pytest.runners import PytestApeRunner
-from ape.utils.basemodel import ManagerAccessMixin
-
-
-def _get_default_network(ecosystem: Optional[EcosystemAPI] = None) -> str:
-    if ecosystem is None:
-        ecosystem = ManagerAccessMixin.network_manager.default_ecosystem
-
-    if ecosystem.default_network.is_mainnet:
-        # Don't use mainnet for tests, even if it configured as
-        # the default.
-        raise ConfigError(
-            "Default network is mainnet; unable to run tests on mainnet. "
-            "Please specify the network using the `--network` flag or "
-            "configure a different default network."
-        )
-
-    return ecosystem.name
 
 
 def pytest_addoption(parser):
@@ -47,7 +23,6 @@ def pytest_addoption(parser):
     add_option(
         "--network",
         action="store",
-        default=_get_default_network(),
         help="Override the default network and provider (see ``ape networks list`` for options).",
     )
     add_option(
@@ -71,7 +46,8 @@ def pytest_addoption(parser):
         action="store",
         help="A comma-separated list of contract:method-name glob-patterns to ignore.",
     )
-    parser.addoption("--coverage", action="store_true", help="Collect contract coverage.")
+    add_option("--coverage", action="store_true", help="Collect contract coverage.")
+    add_option("--project", action="store", help="Change Ape's project")
 
     # NOTE: Other pytest plugins, such as hypothesis, should integrate with pytest separately
 
@@ -93,25 +69,47 @@ def pytest_configure(config):
                 except AttributeError:
                     pass
 
-    config_wrapper = ConfigWrapper(config)
-    receipt_capture = ReceiptCapture(config_wrapper)
-    gas_tracker = GasTracker(config_wrapper)
-    coverage_tracker = CoverageTracker(config_wrapper)
+    if "--help" in config.invocation_params.args:
+        # perf: Don't bother setting up runner if only showing help.
+        return
 
-    if not config.option.verbose:
-        # Enable verbose output if stdout capture is disabled
-        config.option.verbose = config.getoption("capture") == "no"
-    # else: user has already changes verbosity to an equal or higher level; avoid downgrading.
+    from ape.pytest.config import ConfigWrapper
+    from ape.pytest.coverage import CoverageTracker
+    from ape.pytest.fixtures import (
+        FixtureManager,
+        IsolationManager,
+        PytestApeFixtures,
+        ReceiptCapture,
+    )
+    from ape.pytest.gas import GasTracker
+    from ape.pytest.runners import PytestApeRunner
+    from ape.utils.basemodel import ManagerAccessMixin
+
+    if project := config.getoption("--project"):
+        ManagerAccessMixin.local_project.chdir(project)
 
     # Register the custom Ape test runner
-    runner = PytestApeRunner(config_wrapper, receipt_capture, gas_tracker, coverage_tracker)
+    config_wrapper = ConfigWrapper(config)
+    receipt_capture = ReceiptCapture(config_wrapper)
+    isolation_manager = IsolationManager(config_wrapper, receipt_capture)
+    fixture_manager = FixtureManager(config_wrapper, isolation_manager)
+    gas_tracker = GasTracker(config_wrapper)
+    coverage_tracker = CoverageTracker(config_wrapper)
+    runner = PytestApeRunner(
+        config_wrapper,
+        isolation_manager,
+        receipt_capture,
+        gas_tracker,
+        coverage_tracker,
+        fixture_manager=fixture_manager,
+    )
     config.pluginmanager.register(runner, "ape-test")
 
     # Inject runner for access to gas and coverage trackers.
     ManagerAccessMixin._test_runner = runner
 
     # Include custom fixtures for project, accounts etc.
-    fixtures = PytestApeFixtures(config_wrapper, receipt_capture)
+    fixtures = PytestApeFixtures(config_wrapper, isolation_manager)
     config.pluginmanager.register(fixtures, "ape-fixtures")
 
     # Add custom markers

@@ -1,28 +1,28 @@
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 import click
 import yaml
 from rich import print as echo_rich_text
 from rich.tree import Tree
 
-from ape.api import SubprocessProvider
-from ape.cli import ape_cli_context, network_option
-from ape.cli.choices import OutputFormat
-from ape.cli.options import output_format_option
+from ape.cli.choices import LazyChoice, OutputFormat
+from ape.cli.options import ape_cli_context, network_option, output_format_option
 from ape.exceptions import NetworkError
 from ape.logging import LogLevel
-from ape.types import _LazySequence
-from ape.utils.basemodel import ManagerAccessMixin
+
+if TYPE_CHECKING:
+    from ape.api.providers import SubprocessProvider
 
 
-def _filter_option(name: str, options):
+def _filter_option(name: str, get_options: Callable[[], Sequence[str]]):
     return click.option(
         f"--{name}",
         f"{name}_filter",
         multiple=True,
         help=f"Filter the results by {name}",
-        type=click.Choice(options),
+        type=LazyChoice(get_options),
     )
 
 
@@ -33,10 +33,14 @@ def cli():
     """
 
 
-def _lazy_get(name: str) -> _LazySequence:
+def _lazy_get(name: str) -> Sequence:
     # NOTE: Using fn generator to maintain laziness.
     def gen():
-        yield from getattr(ManagerAccessMixin.network_manager, f"{name}_names")
+        from ape.utils.basemodel import ManagerAccessMixin as access
+
+        yield from getattr(access.network_manager, f"{name}_names")
+
+    from ape.types.basic import _LazySequence
 
     return _LazySequence(gen)
 
@@ -44,9 +48,9 @@ def _lazy_get(name: str) -> _LazySequence:
 @cli.command(name="list", short_help="List registered networks")
 @ape_cli_context()
 @output_format_option()
-@_filter_option("ecosystem", _lazy_get("ecosystem"))
-@_filter_option("network", _lazy_get("network"))
-@_filter_option("provider", _lazy_get("provider"))
+@_filter_option("ecosystem", lambda: _lazy_get("ecosystem"))
+@_filter_option("network", lambda: _lazy_get("network"))
+@_filter_option("provider", lambda: _lazy_get("provider"))
 def _list(cli_ctx, output_format, ecosystem_filter, network_filter, provider_filter):
     """
     List all the registered ecosystems, networks, and providers.
@@ -108,20 +112,26 @@ def _list(cli_ctx, output_format, ecosystem_filter, network_filter, provider_fil
 @cli.command(short_help="Start a node process")
 @ape_cli_context()
 @network_option(default="ethereum:local:node")
-def run(cli_ctx, provider):
+@click.option("--block-time", default=None, type=int, help="Block time in seconds")
+def run(cli_ctx, provider, block_time):
     """
     Start a subprocess node as if running independently
     and stream stdout and stderr.
     """
+    from ape.api.providers import SubprocessProvider
+
     # Ignore extra loggers, such as web3 loggers.
     cli_ctx.logger._extra_loggers = {}
-
     if not isinstance(provider, SubprocessProvider):
         cli_ctx.abort(
             f"`ape networks run` requires a provider that manages a process, not '{provider.name}'."
         )
     elif provider.is_connected:
         cli_ctx.abort("Process already running.")
+
+    # Set block time if provided
+    if block_time is not None:
+        provider.provider_settings.update({"block_time": block_time})
 
     # Start showing process logs.
     original_level = cli_ctx.logger.level
@@ -130,6 +140,7 @@ def run(cli_ctx, provider):
 
     # Change format to exclude log level (since it is always just DEBUG)
     cli_ctx.logger.format(fmt="%(message)s")
+
     try:
         _run(cli_ctx, provider)
     finally:
@@ -137,7 +148,8 @@ def run(cli_ctx, provider):
         cli_ctx.logger.format(fmt=original_format)
 
 
-def _run(cli_ctx, provider: SubprocessProvider):
+def _run(cli_ctx, provider: "SubprocessProvider"):
+
     provider.connect()
     if process := provider.process:
         try:

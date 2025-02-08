@@ -7,21 +7,20 @@ import shutil
 import sys
 import time
 import warnings
+from abc import abstractmethod
 from collections.abc import Iterable, Iterator
+from functools import cached_property
 from logging import FileHandler, Formatter, Logger, getLogger
 from pathlib import Path
 from signal import SIGINT, SIGTERM, signal
 from subprocess import DEVNULL, PIPE, Popen
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union, cast
 
-from eth_pydantic_types import HexBytes
-from ethpm_types.abi import EventABI
-from pydantic import Field, computed_field, model_validator
+from eth_utils import to_hex
+from pydantic import Field, computed_field, field_serializer, model_validator
 
-from ape.api.config import PluginConfig
 from ape.api.networks import NetworkAPI
 from ape.api.query import BlockTransactionQuery
-from ape.api.trace import TraceAPI
 from ape.api.transactions import ReceiptAPI, TransactionAPI
 from ape.exceptions import (
     APINotImplementedError,
@@ -33,18 +32,28 @@ from ape.exceptions import (
     VirtualMachineError,
 )
 from ape.logging import LogLevel, logger
-from ape.types import AddressType, BlockID, ContractCode, ContractLog, HexInt, LogFilter, SnapshotID
-from ape.utils import BaseInterfaceModel, JoinableQueue, abstractmethod, cached_property, spawn
+from ape.types.basic import HexInt
+from ape.utils.basemodel import BaseInterfaceModel
 from ape.utils.misc import (
     EMPTY_BYTES32,
     _create_raises_not_implemented_error,
     log_instead_of_fail,
     raises_not_implemented,
+    to_int,
 )
+from ape.utils.process import JoinableQueue, spawn
 from ape.utils.rpc import RPCHeaders
 
 if TYPE_CHECKING:
+    from eth_pydantic_types import HexBytes
+    from ethpm_types.abi import EventABI
+
     from ape.api.accounts import TestAccountAPI
+    from ape.api.config import PluginConfig
+    from ape.api.trace import TraceAPI
+    from ape.types.address import AddressType
+    from ape.types.events import ContractLog, LogFilter
+    from ape.types.vm import BlockID, ContractCode, SnapshotID
 
 
 class BlockAPI(BaseInterfaceModel):
@@ -52,7 +61,7 @@ class BlockAPI(BaseInterfaceModel):
     An abstract class representing a block and its attributes.
     """
 
-    # NOTE: All fields in this class (and it's subclasses) should not be `Optional`
+    # NOTE: All fields in this class (and its subclasses) should not be `Optional`
     #       except the edge cases noted below
 
     num_transactions: HexInt = 0
@@ -74,7 +83,7 @@ class BlockAPI(BaseInterfaceModel):
         default=EMPTY_BYTES32, alias="parentHash"
     )  # NOTE: genesis block has no parent hash
     """
-    The preceeding block's hash.
+    The preceding block's hash.
     """
 
     timestamp: HexInt
@@ -83,11 +92,15 @@ class BlockAPI(BaseInterfaceModel):
     NOTE: The pending block uses the current timestamp.
     """
 
-    _size: Optional[int] = None
+    _size: Optional[HexInt] = None
 
     @log_instead_of_fail(default="<BlockAPI>")
     def __repr__(self) -> str:
-        return super().__repr__()
+        repr_str = f"{self.__class__.__name__} number={self.number}"
+        if hash := self.hash:
+            repr_str = f"{repr_str} hash={to_hex(hash)}"
+
+        return f"<{repr_str}>"
 
     @property
     def datetime(self) -> datetime.datetime:
@@ -111,7 +124,6 @@ class BlockAPI(BaseInterfaceModel):
         Saves it to a private member on this class and
         gets returned in computed field "size".
         """
-
         if isinstance(values, BlockAPI):
             size = values.size
 
@@ -125,9 +137,13 @@ class BlockAPI(BaseInterfaceModel):
 
         model = handler(values)
         if size is not None:
-            model._size = size
+            model._size = to_int(size)
 
         return model
+
+    @field_serializer("size")
+    def serialize_size(self, value):
+        return to_int(value)
 
     @computed_field()  # type: ignore[misc]
     @cached_property
@@ -135,6 +151,10 @@ class BlockAPI(BaseInterfaceModel):
         """
         All transactions in a block.
         """
+        if self.hash is None:
+            # Unable to query transactions.
+            return []
+
         try:
             query = BlockTransactionQuery(columns=["*"], block_id=self.hash)
             return cast(list[TransactionAPI], list(self.query_manager.query(query)))
@@ -145,15 +165,14 @@ class BlockAPI(BaseInterfaceModel):
 
     @computed_field()  # type: ignore[misc]
     @cached_property
-    def size(self) -> int:
+    def size(self) -> HexInt:
         """
         The size of the block in gas. Most of the time,
         this field is passed to the model at validation time,
-        but occassionally it is missing (like in `eth_subscribe:newHeads`),
+        but occasionally it is missing (like in `eth_subscribe:newHeads`),
         in which case it gets calculated if and only if the user
         requests it (or during serialization of this model to disk).
         """
-
         if self._size is not None:
             # The size was provided with the rest of the model
             # (normal).
@@ -169,8 +188,12 @@ class ProviderAPI(BaseInterfaceModel):
     plugin or the `ape-hardhat <https://github.com/ApeWorX/ape-hardhat>`__ plugin.
     """
 
+    # TODO: In 0.9, make not optional.
+    NAME: ClassVar[Optional[str]] = None
+
+    # TODO: Remove in 0.9 and have NAME be defined at the class-level (in plugins).
     name: str
-    """The name of the provider (should be the plugin name)."""
+    """(deprecated: use NAME). The name of the provider (should be the plugin name)."""
 
     network: NetworkAPI
     """A reference to the network this provider provides."""
@@ -221,7 +244,7 @@ class ProviderAPI(BaseInterfaceModel):
     @abstractmethod
     def connect(self):
         """
-        Connect a to a provider, such as start-up a process or create an HTTP connection.
+        Connect to a provider, such as start-up a process or create an HTTP connection.
         """
 
     @abstractmethod
@@ -245,7 +268,7 @@ class ProviderAPI(BaseInterfaceModel):
         return None
 
     @property
-    def settings(self) -> PluginConfig:
+    def settings(self) -> "PluginConfig":
         """
         The combination of settings from ``ape-config.yaml`` and ``.provider_settings``.
         """
@@ -294,7 +317,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @abstractmethod
-    def get_balance(self, address: AddressType, block_id: Optional[BlockID] = None) -> int:
+    def get_balance(self, address: "AddressType", block_id: Optional["BlockID"] = None) -> int:
         """
         Get the balance of an account.
 
@@ -308,7 +331,9 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @abstractmethod
-    def get_code(self, address: AddressType, block_id: Optional[BlockID] = None) -> ContractCode:
+    def get_code(
+        self, address: "AddressType", block_id: Optional["BlockID"] = None
+    ) -> "ContractCode":
         """
         Get the bytes a contract.
 
@@ -340,7 +365,7 @@ class ProviderAPI(BaseInterfaceModel):
     def make_request(self, rpc: str, parameters: Optional[Iterable] = None) -> Any:
         """
         Make a raw RPC request to the provider.
-        Advanced featues such as tracing may utilize this to by-pass unnecessary
+        Advanced features such as tracing may utilize this to by-pass unnecessary
         class-serializations.
         """
 
@@ -361,7 +386,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     # TODO: In 0.9, delete this method.
-    def get_storage_at(self, *args, **kwargs) -> HexBytes:
+    def get_storage_at(self, *args, **kwargs) -> "HexBytes":
         warnings.warn(
             "'provider.get_storage_at()' is deprecated. Use 'provider.get_storage()'.",
             DeprecationWarning,
@@ -370,8 +395,8 @@ class ProviderAPI(BaseInterfaceModel):
 
     @raises_not_implemented
     def get_storage(  # type: ignore[empty-body]
-        self, address: AddressType, slot: int, block_id: Optional[BlockID] = None
-    ) -> HexBytes:
+        self, address: "AddressType", slot: int, block_id: Optional["BlockID"] = None
+    ) -> "HexBytes":
         """
         Gets the raw value of a storage slot of a contract.
 
@@ -386,7 +411,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @abstractmethod
-    def get_nonce(self, address: AddressType, block_id: Optional[BlockID] = None) -> int:
+    def get_nonce(self, address: "AddressType", block_id: Optional["BlockID"] = None) -> int:
         """
         Get the number of times an account has transacted.
 
@@ -400,7 +425,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @abstractmethod
-    def estimate_gas_cost(self, txn: TransactionAPI, block_id: Optional[BlockID] = None) -> int:
+    def estimate_gas_cost(self, txn: TransactionAPI, block_id: Optional["BlockID"] = None) -> int:
         """
         Estimate the cost of gas for a transaction.
 
@@ -435,7 +460,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @property
-    def config(self) -> PluginConfig:
+    def config(self) -> "PluginConfig":
         """
         The provider's configuration.
         """
@@ -473,7 +498,7 @@ class ProviderAPI(BaseInterfaceModel):
         raise APINotImplementedError("base_fee is not implemented by this provider")
 
     @abstractmethod
-    def get_block(self, block_id: BlockID) -> BlockAPI:
+    def get_block(self, block_id: "BlockID") -> BlockAPI:
         """
         Get a block.
 
@@ -493,10 +518,10 @@ class ProviderAPI(BaseInterfaceModel):
     def send_call(
         self,
         txn: TransactionAPI,
-        block_id: Optional[BlockID] = None,
+        block_id: Optional["BlockID"] = None,
         state: Optional[dict] = None,
         **kwargs,
-    ) -> HexBytes:  # Return value of function
+    ) -> "HexBytes":  # Return value of function
         """
         Execute a new transaction call immediately without creating a
         transaction on the block chain.
@@ -529,7 +554,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @abstractmethod
-    def get_transactions_by_block(self, block_id: BlockID) -> Iterator[TransactionAPI]:
+    def get_transactions_by_block(self, block_id: "BlockID") -> Iterator[TransactionAPI]:
         """
         Get the information about a set of transactions from a block.
 
@@ -543,7 +568,7 @@ class ProviderAPI(BaseInterfaceModel):
     @raises_not_implemented
     def get_transactions_by_account_nonce(  # type: ignore[empty-body]
         self,
-        account: AddressType,
+        account: "AddressType",
         start_nonce: int = 0,
         stop_nonce: int = -1,
     ) -> Iterator[ReceiptAPI]:
@@ -572,7 +597,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @abstractmethod
-    def get_contract_logs(self, log_filter: LogFilter) -> Iterator[ContractLog]:
+    def get_contract_logs(self, log_filter: "LogFilter") -> Iterator["ContractLog"]:
         """
         Get logs from contracts.
 
@@ -613,25 +638,25 @@ class ProviderAPI(BaseInterfaceModel):
         raise _create_raises_not_implemented_error(self.send_private_transaction)
 
     @raises_not_implemented
-    def snapshot(self) -> SnapshotID:  # type: ignore[empty-body]
+    def snapshot(self) -> "SnapshotID":  # type: ignore[empty-body]
         """
         Defined to make the ``ProviderAPI`` interchangeable with a
         :class:`~ape.api.providers.TestProviderAPI`, as in
         :class:`ape.managers.chain.ChainManager`.
 
         Raises:
-            :class:`~ape.exceptions.APINotImplementedError`: Unless overriden.
+            :class:`~ape.exceptions.APINotImplementedError`: Unless overridden.
         """
 
     @raises_not_implemented
-    def restore(self, snapshot_id: SnapshotID):
+    def restore(self, snapshot_id: "SnapshotID"):
         """
         Defined to make the ``ProviderAPI`` interchangeable with a
         :class:`~ape.api.providers.TestProviderAPI`, as in
         :class:`ape.managers.chain.ChainManager`.
 
         Raises:
-            :class:`~ape.exceptions.APINotImplementedError`: Unless overriden.
+            :class:`~ape.exceptions.APINotImplementedError`: Unless overridden.
         """
 
     @raises_not_implemented
@@ -642,7 +667,7 @@ class ProviderAPI(BaseInterfaceModel):
         :class:`ape.managers.chain.ChainManager`.
 
         Raises:
-            :class:`~ape.exceptions.APINotImplementedError`: Unless overriden.
+            :class:`~ape.exceptions.APINotImplementedError`: Unless overridden.
         """
 
     @raises_not_implemented
@@ -653,11 +678,11 @@ class ProviderAPI(BaseInterfaceModel):
         :class:`ape.managers.chain.ChainManager`.
 
         Raises:
-            :class:`~ape.exceptions.APINotImplementedError`: Unless overriden.
+            :class:`~ape.exceptions.APINotImplementedError`: Unless overridden.
         """
 
     @raises_not_implemented
-    def set_balance(self, address: AddressType, amount: int):
+    def set_balance(self, address: "AddressType", amount: int):
         """
         Change the balance of an account.
 
@@ -684,7 +709,7 @@ class ProviderAPI(BaseInterfaceModel):
 
     @raises_not_implemented
     def set_code(  # type: ignore[empty-body]
-        self, address: AddressType, code: ContractCode
+        self, address: "AddressType", code: "ContractCode"
     ) -> bool:
         """
         Change the code of a smart contract, for development purposes.
@@ -697,7 +722,7 @@ class ProviderAPI(BaseInterfaceModel):
 
     @raises_not_implemented
     def set_storage(  # type: ignore[empty-body]
-        self, address: AddressType, slot: int, value: HexBytes
+        self, address: "AddressType", slot: int, value: "HexBytes"
     ):
         """
         Sets the raw value of a storage slot of a contract.
@@ -709,7 +734,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @raises_not_implemented
-    def unlock_account(self, address: AddressType) -> bool:  # type: ignore[empty-body]
+    def unlock_account(self, address: "AddressType") -> bool:  # type: ignore[empty-body]
         """
         Ask the provider to allow an address to submit transactions without validating
         signatures. This feature is intended to be subclassed by a
@@ -727,7 +752,7 @@ class ProviderAPI(BaseInterfaceModel):
         """
 
     @raises_not_implemented
-    def relock_account(self, address: AddressType):
+    def relock_account(self, address: "AddressType"):
         """
         Stop impersonating an account.
 
@@ -737,13 +762,13 @@ class ProviderAPI(BaseInterfaceModel):
 
     @raises_not_implemented
     def get_transaction_trace(  # type: ignore[empty-body]
-        self, txn_hash: Union[HexBytes, str]
-    ) -> TraceAPI:
+        self, txn_hash: Union["HexBytes", str]
+    ) -> "TraceAPI":
         """
         Provide a detailed description of opcodes.
 
         Args:
-            transaction_hash (Union[HexBytes, str]): The hash of a transaction
+            txn_hash (Union[HexBytes, str]): The hash of a transaction
               to trace.
 
         Returns:
@@ -785,12 +810,12 @@ class ProviderAPI(BaseInterfaceModel):
     def poll_logs(  # type: ignore[empty-body]
         self,
         stop_block: Optional[int] = None,
-        address: Optional[AddressType] = None,
+        address: Optional["AddressType"] = None,
         topics: Optional[list[Union[str, list[str]]]] = None,
         required_confirmations: Optional[int] = None,
         new_block_timeout: Optional[int] = None,
-        events: Optional[list[EventABI]] = None,
-    ) -> Iterator[ContractLog]:
+        events: Optional[list["EventABI"]] = None,
+    ) -> Iterator["ContractLog"]:
         """
         Poll new blocks. Optionally set a start block to include historical blocks.
 
@@ -865,11 +890,11 @@ class TestProviderAPI(ProviderAPI):
     """
 
     @cached_property
-    def test_config(self) -> PluginConfig:
+    def test_config(self) -> "PluginConfig":
         return self.config_manager.get_config("test")
 
     @abstractmethod
-    def snapshot(self) -> SnapshotID:
+    def snapshot(self) -> "SnapshotID":
         """
         Record the current state of the blockchain with intent to later
         call the method :meth:`~ape.managers.chain.ChainManager.revert`
@@ -880,7 +905,7 @@ class TestProviderAPI(ProviderAPI):
         """
 
     @abstractmethod
-    def restore(self, snapshot_id: SnapshotID):
+    def restore(self, snapshot_id: "SnapshotID"):
         """
         Regress the current call using the given snapshot ID.
         Allows developers to go back to a previous state.
@@ -921,7 +946,7 @@ class TestProviderAPI(ProviderAPI):
     @abstractmethod
     def auto_mine(self) -> bool:
         """
-        Enable or disbale automine.
+        Enable or disable automine.
         """
 
     def _increment_call_func_coverage_hit_count(self, txn: TransactionAPI):

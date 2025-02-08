@@ -12,8 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ape.exceptions import ConfigError
 from ape.logging import logger
-from ape.types import AddressType
-from ape.utils import clean_path
+from ape.types.address import AddressType
 from ape.utils.basemodel import (
     ExtraAttributesMixin,
     ExtraModelAttributes,
@@ -23,6 +22,7 @@ from ape.utils.basemodel import (
     only_raise_attribute_error,
 )
 from ape.utils.misc import load_config
+from ape.utils.os import clean_path
 
 ConfigItemType = TypeVar("ConfigItemType")
 
@@ -66,7 +66,7 @@ class PluginConfig(BaseSettings):
     a config API must register a subclass of this class.
     """
 
-    model_config = SettingsConfigDict(extra="allow")
+    model_config = SettingsConfigDict(extra="allow", env_prefix="APE_")
 
     @classmethod
     def from_overrides(
@@ -285,7 +285,7 @@ class ApeConfig(ExtraAttributesMixin, BaseSettings, ManagerAccessMixin):
 
     def __init__(self, *args, **kwargs):
         project_path = kwargs.get("project")
-        super(BaseSettings, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         # NOTE: Cannot reference `self` at all until after super init.
         self._project_path = project_path
 
@@ -350,7 +350,7 @@ class ApeConfig(ExtraAttributesMixin, BaseSettings, ManagerAccessMixin):
     """
 
     # NOTE: Plugin configs are technically "extras".
-    model_config = SettingsConfigDict(extra="allow")
+    model_config = SettingsConfigDict(extra="allow", env_prefix="APE_")
 
     @model_validator(mode="before")
     @classmethod
@@ -424,6 +424,21 @@ class ApeConfig(ExtraAttributesMixin, BaseSettings, ManagerAccessMixin):
 
     @classmethod
     def validate_file(cls, path: Path, **overrides) -> "ApeConfig":
+        """
+        Create an ApeConfig class using the given path.
+        Supports both pyproject.toml and ape-config.[.yml|.yaml|.json] files.
+
+        Raises:
+            :class:`~ape.exceptions.ConfigError`: When given an unknown file type
+              or the data is invalid.
+
+        Args:
+            path (Path): The path to the file.
+            **overrides: Config overrides.
+
+        Returns:
+            :class:`~ape.api.config.ApeConfig`
+        """
         data = {**load_config(path), **overrides}
 
         # NOTE: We are including the project path here to assist
@@ -462,7 +477,7 @@ class ApeConfig(ExtraAttributesMixin, BaseSettings, ManagerAccessMixin):
         self.__pydantic_extra__ = self.__pydantic_extra__ or {}
         return self.__pydantic_extra__
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "<ape-config.yaml>"
 
     def __str__(self) -> str:

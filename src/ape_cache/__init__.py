@@ -1,23 +1,35 @@
-from ape import plugins
-from ape.api import PluginConfig
+from importlib import import_module
 
-from .query import CacheQueryProvider
-
-
-class CacheConfig(PluginConfig):
-    size: int = 1024**3  # 1gb
+from ape.plugins import Config, QueryPlugin, register
 
 
-@plugins.register(plugins.Config)
+@register(Config)
 def config_class():
+    from ape_cache.config import CacheConfig
+
     return CacheConfig
 
 
-@plugins.register(plugins.QueryPlugin)
+@register(QueryPlugin)
 def query_engines():
-    return CacheQueryProvider
+    query = import_module("ape_cache.query")
+    return query.CacheQueryProvider
+
+
+def __getattr__(name):
+    if name == "CacheQueryProvider":
+        module = import_module("ape_cache.query")
+        return module.CacheQueryProvider
+
+    elif name == "CacheConfig":
+        module = import_module("ape_cache.config")
+        return module.CacheConfig
+
+    else:
+        raise AttributeError(name)
 
 
 __all__ = [
+    "CacheConfig",
     "CacheQueryProvider",
 ]

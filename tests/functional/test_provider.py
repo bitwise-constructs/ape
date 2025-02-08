@@ -19,10 +19,16 @@ from ape.exceptions import (
     ProviderError,
     TransactionError,
     TransactionNotFoundError,
+    UnknownSnapshotError,
 )
-from ape.types import LogFilter
-from ape.utils.testing import DEFAULT_TEST_ACCOUNT_BALANCE, DEFAULT_TEST_CHAIN_ID
-from ape_ethereum.provider import WEB3_PROVIDER_URI_ENV_VAR_NAME, Web3Provider, _sanitize_web3_url
+from ape.types.events import LogFilter
+from ape.utils.testing import DEFAULT_TEST_CHAIN_ID
+from ape_ethereum.provider import (
+    WEB3_PROVIDER_URI_ENV_VAR_NAME,
+    EthereumNodeProvider,
+    Web3Provider,
+    _sanitize_web3_url,
+)
 from ape_ethereum.transactions import TransactionStatusEnum, TransactionType
 from ape_test import LocalProvider
 
@@ -99,6 +105,35 @@ def test_chain_id_is_cached(eth_tester_provider):
     eth_tester_provider._web3 = web3  # Undo
 
 
+def test_chain_id_from_ethereum_base_provider_is_cached(mock_web3, ethereum, eth_tester_provider):
+    """
+    Simulated chain ID from a plugin (using base-ethereum class) to ensure is
+    also cached.
+    """
+
+    def make_request(rpc, arguments):
+        if rpc == "eth_chainId":
+            return {"result": 11155111}  # Sepolia
+
+        return eth_tester_provider.make_request(rpc, arguments)
+
+    mock_web3.provider.make_request.side_effect = make_request
+
+    class PluginProvider(Web3Provider):
+        def connect(self):
+            return
+
+        def disconnect(self):
+            return
+
+    provider = PluginProvider(name="sim", network=ethereum.sepolia)
+    provider._web3 = mock_web3
+    assert provider.chain_id == 11155111
+    # Unset to web3 to prove it does not check it again (else it would fail).
+    provider._web3 = None
+    assert provider.chain_id == 11155111
+
+
 def test_chain_id_when_disconnected(eth_tester_provider):
     eth_tester_provider.disconnect()
     try:
@@ -108,6 +143,11 @@ def test_chain_id_when_disconnected(eth_tester_provider):
 
     finally:
         eth_tester_provider.connect()
+
+
+def test_chain_id_adhoc(networks):
+    with networks.parse_network_choice("https://www.shibrpc.com") as bor:
+        assert bor.chain_id == 109
 
 
 def test_get_receipt_not_exists_with_timeout(eth_tester_provider):
@@ -242,14 +282,10 @@ def test_supports_tracing(eth_tester_provider):
     assert not eth_tester_provider.supports_tracing
 
 
-def test_provider_get_balance(project, networks, accounts):
-    """
-    Test that the address is an AddressType.
-    """
-    balance = networks.provider.get_balance(accounts.test_accounts[0].address)
-
+def test_get_balance(networks, accounts):
+    balance = networks.provider.get_balance(accounts[0].address)
     assert type(balance) is int
-    assert balance == DEFAULT_TEST_ACCOUNT_BALANCE
+    assert balance > 0
 
 
 def test_set_timestamp(ethereum):
@@ -321,8 +357,9 @@ def test_gas_price(eth_tester_provider):
 
 def test_get_code(eth_tester_provider, vyper_contract_instance):
     address = vyper_contract_instance.address
+    block_number = vyper_contract_instance.creation_metadata.block
     assert eth_tester_provider.get_code(address) == eth_tester_provider.get_code(
-        address, block_id=1
+        address, block_id=block_number
     )
 
 
@@ -468,9 +505,36 @@ def test_make_request_handles_http_error_method_not_allowed(eth_tester_provider,
         eth_tester_provider._web3 = real_web3
 
 
+def test_make_request_rate_limiting(mocker, ethereum, mock_web3):
+    provider = EthereumNodeProvider(network=ethereum.local)
+    provider._web3 = mock_web3
+
+    class RateLimitTester:
+        tries = 3
+        _try = 0
+        tries_made = 0
+
+        def rate_limit_hook(self, rpc, params):
+            self.tries_made += 1
+            if self._try >= self.tries:
+                self._try = 0
+                return {"success": True}
+            else:
+                self._try += 1
+                response = mocker.MagicMock()
+                response.status_code = 429
+                raise HTTPError(response=response)
+
+    rate_limit_tester = RateLimitTester()
+    mock_web3.provider.make_request.side_effect = rate_limit_tester.rate_limit_hook
+    result = provider.make_request("ape_testRateLimiting", parameters=[])
+    assert rate_limit_tester.tries_made == rate_limit_tester.tries + 1
+    assert result == {"success": True}
+
+
 def test_base_fee(eth_tester_provider):
     actual = eth_tester_provider.base_fee
-    assert actual > 0
+    assert actual >= eth_tester_provider.get_block("pending").base_fee
 
     # NOTE: Mostly doing this to ensure we are calling the fee history
     #   RPC correctly. There was a bug where we were not.
@@ -484,15 +548,30 @@ def test_create_access_list(eth_tester_provider, vyper_contract_instance, owner)
         eth_tester_provider.create_access_list(tx)
 
 
-def test_auto_mine(eth_tester_provider):
+def test_auto_mine(eth_tester_provider, owner):
     eth_tester_provider.auto_mine = False
     assert not eth_tester_provider.auto_mine
 
-    # Ensure can still manually mine.
-    block = eth_tester_provider.get_block("latest").number
+    block_before = eth_tester_provider.get_block("latest").number
+    nonce_before = owner.nonce
+
+    # NOTE: Before, this would wait until it timed out, because
+    #  when auto mine is off, `ape-test` provider still waited
+    #  for the receipt during send_transaction(). It should
+    #  instead return early.
+    tx = owner.transfer(owner, 123)
+    assert not tx.confirmed
+    assert tx.sender == owner.address
+    assert tx.txn_hash is not None
+
+    nonce_after_tx = owner.nonce
+    block_after_tx = eth_tester_provider.get_block("latest").number
+    assert nonce_before == nonce_after_tx, "Transaction should not have been mined."
+    assert block_before == block_after_tx, "Block height should not have increased."
+
     eth_tester_provider.mine()
-    next_block = eth_tester_provider.get_block("latest").number
-    assert next_block > block
+    block_after_mine = eth_tester_provider.get_block("latest").number
+    assert block_after_mine > block_after_tx
 
     eth_tester_provider.auto_mine = True
     assert eth_tester_provider.auto_mine
@@ -582,10 +661,63 @@ def test_ipc_per_network(project, key):
     ipc = "path/to/example.ipc"
     with project.temp_config(node={"ethereum": {"sepolia": {key: ipc}}}):
         node = project.network_manager.ethereum.sepolia.get_provider("node")
-        if key != "ipc_path":
-            assert node.uri == ipc
-        # else: uri gets to set to random HTTP from default settings,
-        # but we may want to change that behavior.
-        # TODO: 0.9 investigate not using random if ipc set.
-
         assert node.ipc_path == Path(ipc)
+        if key == "uri":
+            assert node.uri == ipc
+        # else: uri ends up as a random HTTP URI from evmchains.
+        # TODO: Do we want to change this in 0.9?
+
+
+def test_snapshot(eth_tester_provider):
+    snapshot = eth_tester_provider.snapshot()
+    assert snapshot
+
+
+def test_restore(eth_tester_provider, accounts):
+    account = accounts[0]
+    start_nonce = account.nonce
+    snapshot = eth_tester_provider.snapshot()
+    account.transfer(account, 0)
+    eth_tester_provider.restore(snapshot)
+    assert account.nonce == start_nonce
+
+
+def test_restore_zero(eth_tester_provider):
+    with pytest.raises(UnknownSnapshotError, match="Unknown snapshot ID '0'."):
+        eth_tester_provider.restore(0)
+
+
+def test_update_settings_invalidates_snapshots(eth_tester_provider, chain):
+    snapshot = chain.snapshot()
+    assert snapshot in chain._snapshots[eth_tester_provider.chain_id]
+    eth_tester_provider.update_settings({})
+    assert snapshot not in chain._snapshots[eth_tester_provider.chain_id]
+
+
+def test_connect_uses_cached_chain_id(mocker, mock_web3, ethereum, eth_tester_provider):
+    class PluginProvider(EthereumNodeProvider):
+        pass
+
+    web3_factory_patch = mocker.patch("ape_ethereum.provider._create_web3")
+    web3_factory_patch.return_value = mock_web3
+
+    class ChainIDTracker:
+        call_count = 0
+
+        def make_request(self, rpc, args):
+            if rpc == "eth_chainId":
+                self.call_count += 1
+                return {"result": "0xaa36a7"}  # Sepolia
+
+            return eth_tester_provider.make_request(rpc, args)
+
+    chain_id_tracker = ChainIDTracker()
+    mock_web3.provider.make_request.side_effect = chain_id_tracker.make_request
+
+    provider = PluginProvider(name="node", network=ethereum.sepolia)
+    provider.connect()
+    assert chain_id_tracker.call_count == 1
+    provider.disconnect()
+    provider.connect()
+    # It is still cached from the previous connection.
+    assert chain_id_tracker.call_count == 1

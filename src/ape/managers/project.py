@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import shutil
 from collections.abc import Callable, Iterable, Iterator
@@ -39,11 +40,12 @@ from ape.utils.os import (
     get_relative_path,
     in_tempdir,
     path_match,
+    within_directory,
 )
 
 
 def _path_to_source_id(path: Path, root_path: Path) -> str:
-    return f"{get_relative_path(path.absolute(), root_path.absolute())}"
+    return f"{path.relative_to(root_path)}"
 
 
 class SourceManager(BaseManager):
@@ -495,9 +497,7 @@ class ContractManager(BaseManager):
         ):
             self._compile_contracts(needs_compile)
 
-        src_ids = [
-            f"{get_relative_path(Path(p).absolute(), self.project.path)}" for p in path_ls_final
-        ]
+        src_ids = [f"{Path(p).relative_to(self.project.path)}" for p in path_ls_final]
         for contract_type in (self.project.manifest.contract_types or {}).values():
             if contract_type.source_id and contract_type.source_id in src_ids:
                 yield ContractContainer(contract_type)
@@ -656,7 +656,13 @@ class Dependency(BaseManager, ExtraAttributesMixin):
         if self._installation is not None:
             return True
 
-        elif self.project_path.is_dir():
+        try:
+            project_path = self.project_path
+        except ProjectError:
+            # Fails when version ID errors out (bad config / missing required install etc.)
+            return False
+
+        if project_path.is_dir():
             if any(x for x in self.project_path.iterdir() if not x.name.startswith(".")):
                 return True
 
@@ -1203,13 +1209,22 @@ class DependencyManager(BaseManager):
         """
 
         for api in self.config_apis:
+            try:
+                api_version_id = api.version_id
+            except Exception:
+                api_version_id = None
+
             if (name is not None and api.name != name and api.package_id != name) or (
-                version is not None and api.version_id != version
+                version is not None and api_version_id != version
             ):
                 continue
 
             # Ensure the dependency API data is known.
-            dependency = self.add(api)
+            if api_version_id is not None:
+                dependency = self.add(api)
+            else:
+                # Errored.
+                dependency = Dependency(api)
 
             if allow_install:
                 try:
@@ -1390,7 +1405,7 @@ class DependencyManager(BaseManager):
             dependency_id (str): The package ID of the dependency. You can also
               provide the short-name of the dependency.
             version (str): The version identifier.
-            allow_install (bool): If the dependendency API is known but the
+            allow_install (bool): If the dependency API is known but the
               project is not installed, attempt to install it. Defaults to ``True``.
 
         Raises:
@@ -1465,7 +1480,6 @@ class DependencyManager(BaseManager):
         Returns:
             class:`~ape.managers.project.Dependency`
         """
-
         api = self.decode_dependency(**dependency) if isinstance(dependency, dict) else dependency
         self.packages_cache.cache_api(api)
 
@@ -1633,8 +1647,14 @@ class ProjectManager(ExtraAttributesMixin, BaseManager):
     def create_temporary_project(
         cls, config_override: Optional[dict] = None
     ) -> Iterator["LocalProject"]:
+        cls._invalidate_project_dependent_caches()
         with create_tempdir() as path:
             yield LocalProject(path, config_override=config_override)
+
+    @classmethod
+    def _invalidate_project_dependent_caches(cls):
+        cls.account_manager.test_accounts.reset()
+        cls.network_manager._invalidate_cache()
 
 
 class Project(ProjectManager):
@@ -1763,6 +1783,8 @@ class Project(ProjectManager):
             path.write_text(str(src.content), encoding="utf8")
 
         # Unpack config file.
+        # NOTE: Always unpacks into a regular .yaml config file for simplicity
+        #   and maximum portibility.
         self.config.write_to_disk(destination / "ape-config.yaml")
 
         return LocalProject(destination, config_override=config_override)
@@ -1837,7 +1859,7 @@ class Project(ProjectManager):
                         *(matching_given_compiler.contractTypes or []),
                     }
                 )
-                # NOTE: Purposely we don't add the exising compiler back,
+                # NOTE: Purposely we don't add the existing compiler back,
                 #   as it is the same as the given compiler, (meaning same
                 #   name, version, and settings), and we have
                 #   merged their contract types.
@@ -1940,8 +1962,7 @@ class Project(ProjectManager):
 
         self._config_override = overrides
         _ = self.config
-
-        self.account_manager.test_accounts.reset()
+        self._invalidate_project_dependent_caches()
 
     def extract_manifest(self) -> PackageManifest:
         # Attempt to compile, if needed.
@@ -1997,7 +2018,7 @@ class DeploymentManager(ManagerAccessMixin):
 
         return result
 
-    def track(self, contract: ContractInstance):
+    def track(self, contract: ContractInstance, allow_dev: bool = False):
         """
         Indicate that a contract deployment should be included in the package manifest
         upon publication.
@@ -2008,9 +2029,9 @@ class DeploymentManager(ManagerAccessMixin):
         Args:
             contract (:class:`~ape.contracts.base.ContractInstance`): The contract
               to track as a deployment of the project.
+            allow_dev (bool): Set to ``True`` if simulating in a local dev environment.
         """
-
-        if self.provider.network.is_dev:
+        if not allow_dev and self.provider.network.is_dev:
             raise ProjectError("Can only publish deployments on a live network.")
 
         elif not (contract_name := contract.contract_type.name):
@@ -2130,8 +2151,6 @@ class LocalProject(Project):
 
         super().__init__(manifest, config_override=self._config_override)
 
-        self.path = self._base_path / (self.config.base_path or "")
-
         # NOTE: Avoid pointlessly adding info to the __local__ manifest.
         # This is mainly for dependencies.
         if self.manifest_path.stem != "__local__" and not manifest.sources:
@@ -2214,8 +2233,17 @@ class LocalProject(Project):
                         "missing compilers for extensions: " + f'{", ".join(sorted(missing_exts))}?'
                     )
 
-            err.args = (message,)
-            raise  # The same exception (keep the stack the same height).
+            # NOTE: Purposely discard the stack-trace and raise a new exception.
+            #   This shows a better stack-trace to the user (rather than weird
+            #   BaseModel internals).
+            raise AttributeError(message)
+
+    @cached_property
+    def path(self) -> Path:
+        """
+        The path to the project's "base" (where contract source IDs are relative to).
+        """
+        return self._base_path / (self.config.base_path or "")
 
     @property
     def _contract_sources(self) -> list[ContractSource]:
@@ -2275,10 +2303,10 @@ class LocalProject(Project):
             return default_project
 
         # ape-config.yaml does no exist. Check for another ProjectAPI type.
-        project_classes: list[type[ProjectAPI]] = [
-            t[1] for t in list(self.plugin_manager.projects)  # type: ignore
-        ]
-        plugins = [t for t in project_classes if not issubclass(t, ApeProject)]
+        project_classes: Iterator[type[ProjectAPI]] = (
+            t[1] for t in self.plugin_manager.projects  # type: ignore
+        )
+        plugins = (t for t in project_classes if not issubclass(t, ApeProject))
         for api in plugins:
             if instance := api.attempt_validate(path=self._base_path):
                 return instance
@@ -2555,6 +2583,41 @@ class LocalProject(Project):
 
         self.sources._path_cache = None
         self._clear_cached_config()
+
+    def chdir(self, path: Optional[Path] = None):
+        """
+        Change the local project to the new path.
+
+        Args:
+            path (Path): The path of the new project.
+              If not given, defaults to the project's path.
+        """
+        path = path or self.path
+        os.chdir(path)
+        if self.path == path:
+            return  # Already setup.
+
+        # New path: clear cached properties.
+        for attr in list(self.__dict__.keys()):
+            if isinstance(getattr(type(self), attr, None), cached_property):
+                del self.__dict__[attr]
+
+        # Re-initialize
+        self._session_source_change_check = set()
+        self._config_override = {}
+        self._base_path = Path(path).resolve()
+        self.manifest_path = self._base_path / ".build" / "__local__.json"
+        self._manifest = self.load_manifest()
+
+    @contextmanager
+    def within_project_path(self):
+        """
+        A context-manager for changing the current working directory to the
+        project's ``.path``. Then, switching back to whatever the current
+        directory was before calling this method.
+        """
+        with within_directory(self.path):
+            yield
 
     def reload_config(self):
         """

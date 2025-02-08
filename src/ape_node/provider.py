@@ -2,23 +2,22 @@ import atexit
 import shutil
 from pathlib import Path
 from subprocess import DEVNULL, PIPE, Popen
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
+from urllib.parse import urlparse
 
 from eth_utils import add_0x_prefix, to_hex
-from evmchains import get_random_rpc
-from geth.chain import initialize_chain
+from geth.chain import initialize_chain as initialize_gethdev_chain
 from geth.process import BaseGethProcess
-from geth.types import GenesisDataTypedDict
 from geth.wrapper import construct_test_chain_kwargs
 from pydantic import field_validator
 from pydantic_settings import SettingsConfigDict
 from requests.exceptions import ConnectionError
-from web3.middleware import ExtraDataToPOAMiddleware
-from yarl import URL
 
-from ape.api import PluginConfig, SubprocessProvider, TestAccountAPI, TestProviderAPI
+from ape.api.config import PluginConfig
+from ape.api.providers import SubprocessProvider, TestProviderAPI
+from ape.exceptions import VirtualMachineError
 from ape.logging import LogLevel, logger
-from ape.types import SnapshotID
+from ape.utils._web3_compat import ExtraDataToPOAMiddleware
 from ape.utils.misc import ZERO_ADDRESS, log_instead_of_fail, raises_not_implemented
 from ape.utils.process import JoinableQueue, spawn
 from ape.utils.testing import (
@@ -37,10 +36,18 @@ from ape_ethereum.provider import (
 )
 from ape_ethereum.trace import TraceApproach
 
+if TYPE_CHECKING:
+    from geth.types import GenesisDataTypedDict
+
+    from ape.api.accounts import TestAccountAPI
+    from ape.api.transactions import ReceiptAPI, TransactionAPI
+    from ape.types.vm import SnapshotID
+
+
 Alloc = dict[str, dict[str, Any]]
 
 
-def create_genesis_data(alloc: Alloc, chain_id: int) -> GenesisDataTypedDict:
+def create_genesis_data(alloc: Alloc, chain_id: int) -> "GenesisDataTypedDict":
     """
     A wrapper around genesis data for py-geth that
     fills in more defaults.
@@ -84,13 +91,17 @@ def create_genesis_data(alloc: Alloc, chain_id: int) -> GenesisDataTypedDict:
 class GethDevProcess(BaseGethProcess):
     """
     A developer-configured geth that only exists until disconnected.
+    (Implementation detail of the local node provider).
     """
 
     def __init__(
         self,
         data_dir: Path,
-        hostname: str = DEFAULT_HOSTNAME,
-        port: int = DEFAULT_PORT,
+        hostname: Optional[str] = None,
+        port: Optional[int] = None,
+        ipc_path: Optional[Path] = None,
+        ws_hostname: Optional[str] = None,
+        ws_port: Optional[str] = None,
         mnemonic: str = DEFAULT_TEST_MNEMONIC,
         number_of_accounts: int = DEFAULT_NUMBER_OF_TEST_ACCOUNTS,
         chain_id: int = DEFAULT_TEST_CHAIN_ID,
@@ -99,86 +110,166 @@ class GethDevProcess(BaseGethProcess):
         auto_disconnect: bool = True,
         extra_funded_accounts: Optional[list[str]] = None,
         hd_path: Optional[str] = DEFAULT_TEST_HD_PATH,
+        block_time: Optional[int] = None,
+        generate_accounts: bool = True,
+        initialize_chain: bool = True,
     ):
         executable = executable or "geth"
         if not shutil.which(executable):
             raise NodeSoftwareNotInstalledError()
 
         self._data_dir = data_dir
-        self._hostname = hostname
-        self._port = port
         self.is_running = False
         self._auto_disconnect = auto_disconnect
 
-        geth_kwargs = construct_test_chain_kwargs(
-            data_dir=self.data_dir,
-            geth_executable=executable,
-            rpc_addr=hostname,
-            rpc_port=f"{port}",
-            network_id=f"{chain_id}",
-            ws_enabled=False,
-            ws_addr=None,
-            ws_origins=None,
-            ws_port=None,
-            ws_api=None,
-        )
+        kwargs_ctor: dict = {
+            "data_dir": self.data_dir,
+            "geth_executable": executable,
+            "network_id": f"{chain_id}",
+        }
+        if hostname is not None:
+            kwargs_ctor["rpc_addr"] = hostname
+        if port is not None:
+            kwargs_ctor["rpc_port"] = f"{port}"
+        if ws_hostname:
+            kwargs_ctor["ws_enabled"] = True
+            kwargs_ctor["ws_addr"] = ws_hostname
+        if ws_port:
+            kwargs_ctor["ws_enabled"] = True
+            kwargs_ctor["ws_port"] = f"{ws_port}"
+        if ipc_path is not None:
+            kwargs_ctor["ipc_path"] = f"{ipc_path}"
+        if not kwargs_ctor.get("ws_enabled"):
+            kwargs_ctor["ws_api"] = None
+            kwargs_ctor["ws_enabled"] = False
+            kwargs_ctor["ws_addr"] = None
+            kwargs_ctor["ws_port"] = None
+        if block_time is not None:
+            kwargs_ctor["dev_period"] = f"{block_time}"
+
+        geth_kwargs = construct_test_chain_kwargs(**kwargs_ctor)
 
         # Ensure a clean data-dir.
         self._clean()
 
         geth_kwargs["dev_mode"] = True
         hd_path = hd_path or DEFAULT_TEST_HD_PATH
-        self._dev_accounts = generate_dev_accounts(
-            mnemonic, number_of_accounts=number_of_accounts, hd_path=hd_path
-        )
-        addresses = [a.address for a in self._dev_accounts]
-        addresses.extend(extra_funded_accounts or [])
-        bal_dict = {"balance": str(initial_balance)}
-        alloc = {a: bal_dict for a in addresses}
-        genesis = create_genesis_data(alloc, chain_id)
-        initialize_chain(genesis, self.data_dir)
+
+        if generate_accounts:
+            self._dev_accounts = generate_dev_accounts(
+                mnemonic, number_of_accounts=number_of_accounts, hd_path=hd_path
+            )
+        else:
+            self._dev_accounts = []
+
+        if initialize_chain:
+            addresses = [a.address for a in self._dev_accounts]
+            addresses.extend(extra_funded_accounts or [])
+            bal_dict = {"balance": str(initial_balance)}
+            alloc = {a: bal_dict for a in addresses}
+            genesis = create_genesis_data(alloc, chain_id)
+            initialize_gethdev_chain(genesis, self.data_dir)
+
         super().__init__(geth_kwargs)
 
     @classmethod
     def from_uri(cls, uri: str, data_folder: Path, **kwargs):
-        parsed_uri = URL(uri)
-
-        if parsed_uri.host not in ("localhost", "127.0.0.1"):
-            raise ConnectionError(f"Unable to start Geth on non-local host {parsed_uri.host}.")
-
-        port = parsed_uri.port if parsed_uri.port is not None else DEFAULT_PORT
         mnemonic = kwargs.get("mnemonic", DEFAULT_TEST_MNEMONIC)
         number_of_accounts = kwargs.get("number_of_accounts", DEFAULT_NUMBER_OF_TEST_ACCOUNTS)
         balance = kwargs.get("initial_balance", DEFAULT_TEST_ACCOUNT_BALANCE)
         extra_accounts = [a.lower() for a in kwargs.get("extra_funded_accounts", [])]
+        block_time = kwargs.get("block_time", None)
+        if isinstance(block_time, int):
+            block_time = f"{block_time}"
 
-        return cls(
-            data_folder,
-            auto_disconnect=kwargs.get("auto_disconnect", True),
-            executable=kwargs.get("executable"),
-            extra_funded_accounts=extra_accounts,
-            hd_path=kwargs.get("hd_path", DEFAULT_TEST_HD_PATH),
-            hostname=parsed_uri.host,
-            initial_balance=balance,
-            mnemonic=mnemonic,
-            number_of_accounts=number_of_accounts,
-            port=port,
-        )
+        process_kwargs = {
+            "auto_disconnect": kwargs.get("auto_disconnect", True),
+            "block_time": block_time,
+            "executable": kwargs.get("executable"),
+            "extra_funded_accounts": extra_accounts,
+            "hd_path": kwargs.get("hd_path", DEFAULT_TEST_HD_PATH),
+            "initial_balance": balance,
+            "mnemonic": mnemonic,
+            "number_of_accounts": number_of_accounts,
+        }
+
+        parsed_uri = urlparse(uri)
+        if not parsed_uri.netloc:
+            path = Path(parsed_uri.path)
+            if path.suffix == ".ipc":
+                # Was given an IPC path.
+                process_kwargs["ipc_path"] = path
+
+            else:
+                raise ConnectionError(f"Unrecognized path type: '{path}'.")
+
+        elif hostname := parsed_uri.hostname:
+            if hostname not in ("localhost", "127.0.0.1"):
+                raise ConnectionError(
+                    f"Unable to start Geth on non-local host {parsed_uri.hostname}."
+                )
+
+            if parsed_uri.scheme.startswith("ws"):
+                process_kwargs["ws_hostname"] = hostname
+                process_kwargs["ws_port"] = parsed_uri.port or DEFAULT_PORT
+            elif parsed_uri.scheme.startswith("http"):
+                process_kwargs["hostname"] = hostname or DEFAULT_HOSTNAME
+                process_kwargs["port"] = parsed_uri.port or DEFAULT_PORT
+            else:
+                raise ConnectionError(f"Unsupported scheme: '{parsed_uri.scheme}'.")
+
+        return cls(data_folder, **process_kwargs)
 
     @property
     def data_dir(self) -> str:
         return f"{self._data_dir}"
 
+    @property
+    def _hostname(self) -> Optional[str]:
+        return self.geth_kwargs.get("rpc_addr")
+
+    @property
+    def _port(self) -> Optional[str]:
+        return self.geth_kwargs.get("rpc_port")
+
+    @property
+    def _ws_hostname(self) -> Optional[str]:
+        return self.geth_kwargs.get("ws_addr")
+
+    @property
+    def _ws_port(self) -> Optional[str]:
+        return self.geth_kwargs.get("ws_port")
+
     def connect(self, timeout: int = 60):
-        home = str(Path.home())
-        ipc_path = self.ipc_path.replace(home, "$HOME")
-        logger.info(f"Starting geth (HTTP='{self._hostname}:{self._port}', IPC={ipc_path}).")
+        self._log_connection()
         self.start()
         self.wait_for_rpc(timeout=timeout)
 
         # Register atexit handler to make sure disconnect is called for normal object lifecycle.
         if self._auto_disconnect:
             atexit.register(self.disconnect)
+
+    def _log_connection(self):
+        home = str(Path.home())
+        ipc_path = self.ipc_path.replace(home, "$HOME")
+
+        http_log = ""
+        if self._hostname:
+            http_log = f"HTTP={self._hostname}"
+            if port := self._port:
+                http_log = f"{http_log}:{port}"
+
+        ipc_log = f"IPC={ipc_path}"
+
+        ws_log = ""
+        if self._ws_hostname:
+            ws_log = f"WS={self._ws_hostname}"
+            if port := self._ws_port:
+                ws_log = f"{ws_log}:{port}"
+
+        connection_logs = ", ".join(x for x in (http_log, ipc_log, ws_log) if x)
+
+        logger.info(f"Starting geth ({connection_logs}).")
 
     def start(self):
         if self.is_running:
@@ -202,7 +293,12 @@ class GethDevProcess(BaseGethProcess):
 
     def _clean(self):
         if self._data_dir.is_dir():
-            shutil.rmtree(self._data_dir)
+            # In case data-dir is being used for something else,
+            # only delete geth-dev node related stuff.
+            (self._data_dir / "genesis.json").unlink(missing_ok=True)
+            shutil.rmtree((self._data_dir / "geth").as_posix(), ignore_errors=True)
+            shutil.rmtree((self._data_dir / "keystore").as_posix(), ignore_errors=True)
+            shutil.rmtree((self._data_dir / "subprocess_output").as_posix(), ignore_errors=True)
 
         # dir must exist when initializing chain.
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -216,13 +312,28 @@ class GethDevProcess(BaseGethProcess):
 
 class EthereumNetworkConfig(PluginConfig):
     # Make sure you are running the right networks when you try for these
-    mainnet: dict = {"uri": get_random_rpc("ethereum", "mainnet")}
-    holesky: dict = {"uri": get_random_rpc("ethereum", "holesky")}
-    sepolia: dict = {"uri": get_random_rpc("ethereum", "sepolia")}
+    mainnet: dict = {}
+    holesky: dict = {}
+    sepolia: dict = {}
     # Make sure to run via `geth --dev` (or similar)
-    local: dict = {**DEFAULT_SETTINGS.copy(), "chain_id": DEFAULT_TEST_CHAIN_ID}
+    local: dict = {**DEFAULT_SETTINGS.copy(), "chain_id": DEFAULT_TEST_CHAIN_ID, "block_time": 0}
 
-    model_config = SettingsConfigDict(extra="allow")
+    model_config = SettingsConfigDict(extra="allow", env_prefix="APE_NODE_")
+
+    @field_validator("local", mode="before")
+    @classmethod
+    def _validate_local(cls, value):
+        value = value or {}
+        if not value:
+            return {**DEFAULT_SETTINGS.copy(), "chain_id": DEFAULT_TEST_CHAIN_ID}
+
+        if "chain_id" not in value:
+            value["chain_id"] = DEFAULT_TEST_CHAIN_ID
+        if "uri" not in value and "ipc_path" in value or "ws_uri" in value or "http_uri" in value:
+            # No need to add default HTTP URI if was given only IPC Path
+            return {**{k: v for k, v in DEFAULT_SETTINGS.items() if k != "uri"}, **value}
+
+        return {**DEFAULT_SETTINGS, **value}
 
 
 class EthereumNodeConfig(PluginConfig):
@@ -267,7 +378,7 @@ class EthereumNodeConfig(PluginConfig):
     Optionally specify request headers to use whenever using this provider.
     """
 
-    model_config = SettingsConfigDict(extra="allow")
+    model_config = SettingsConfigDict(extra="allow", env_prefix="APE_NODE_")
 
     @field_validator("call_trace_approach", mode="before")
     @classmethod
@@ -288,6 +399,7 @@ class NodeSoftwareNotInstalledError(ConnectionError):
 
 
 # NOTE: Using EthereumNodeProvider because of it's geth-derived default behavior.
+# TODO: In 0.9, change NAME to be `gethdev`, so for local networks it is more obvious.
 class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
     _process: Optional[GethDevProcess] = None
     name: str = "node"
@@ -299,6 +411,10 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
     @property
     def chain_id(self) -> int:
         return self.settings.ethereum.local.get("chain_id", DEFAULT_TEST_CHAIN_ID)
+
+    @property
+    def block_time(self) -> Optional[int]:
+        return self.settings.ethereum.local.get("block_time")
 
     @property
     def data_dir(self) -> Path:
@@ -332,6 +448,7 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
         if self.is_connected:
             self._complete_connect()
         else:
+            # Starting the process.
             self.start()
 
     def start(self, timeout: int = 20):
@@ -377,8 +494,10 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
         extra_accounts = list({a.lower() for a in extra_accounts})
         test_config["extra_funded_accounts"] = extra_accounts
         test_config["initial_balance"] = self.test_config.balance
-
-        return GethDevProcess.from_uri(self.uri, self.data_dir, **test_config)
+        uri = self.ws_uri or self.uri
+        return GethDevProcess.from_uri(
+            uri, self.data_dir, block_time=self.block_time, **test_config
+        )
 
     def disconnect(self):
         # Must disconnect process first.
@@ -390,12 +509,33 @@ class GethDev(EthereumNodeProvider, TestProviderAPI, SubprocessProvider):
         # NOTE: Type ignore is wrong; TODO: figure out why.
         self.process = None  # type: ignore[assignment]
 
+        # Clear any snapshots.
+        self.chain_manager._snapshots[self.chain_id] = []
+
         super().disconnect()
 
-    def snapshot(self) -> SnapshotID:
+    def send_transaction(self, txn: "TransactionAPI") -> "ReceiptAPI":
+        try:
+            return super().send_transaction(txn)
+        except VirtualMachineError as err:
+            if (
+                txn.sender in self.account_manager.test_accounts
+                and "exceeds block gas limit" in str(err)
+            ):
+                # Changed, possibly due to other transactions (x-dist?).
+                # Retry using block gas limit.
+                txn.gas_limit = self.chain_manager.blocks.head.gas_limit
+                account = self.account_manager.test_accounts[txn.sender]
+                signed_transaction = account.sign_transaction(txn)
+                logger.debug("Gas-limit exceeds block gas limit. Retrying using block gas limit.")
+                return super().send_transaction(signed_transaction)
+
+            raise  # Whatever error it already is (Ape-ified from ape-ethereum.provider base).
+
+    def snapshot(self) -> "SnapshotID":
         return self._get_latest_block().number or 0
 
-    def restore(self, snapshot_id: SnapshotID):
+    def restore(self, snapshot_id: "SnapshotID"):
         if isinstance(snapshot_id, int):
             block_number_int = snapshot_id
             block_number_hex_str = str(to_hex(snapshot_id))

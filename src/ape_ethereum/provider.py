@@ -9,35 +9,43 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from functools import cached_property, wraps
 from pathlib import Path
-from typing import Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
 
 import ijson  # type: ignore
 import requests
 from eth_pydantic_types import HexBytes
 from eth_typing import BlockNumber, HexStr
 from eth_utils import add_0x_prefix, is_hex, to_hex
-from ethpm_types import EventABI
-from evmchains import get_random_rpc
+from evmchains import PUBLIC_CHAIN_META, get_random_rpc
 from pydantic.dataclasses import dataclass
 from requests import HTTPError
-from web3 import HTTPProvider, IPCProvider, Web3, WebSocketProvider
+from web3 import HTTPProvider, IPCProvider, Web3
+from web3 import __version__ as web3_version
 from web3.exceptions import ContractLogicError as Web3ContractLogicError
 from web3.exceptions import (
     ExtraDataLengthError,
     MethodUnavailable,
     TimeExhausted,
     TransactionNotFound,
-    Web3RPCError,
 )
+
+try:
+    from web3.exceptions import Web3RPCError  # type: ignore
+except ImportError:
+    Web3RPCError = ValueError  # type: ignore
+
 from web3.gas_strategies.rpc import rpc_gas_price_strategy
-from web3.middleware import ExtraDataToPOAMiddleware
 from web3.middleware.validation import MAX_EXTRADATA_LENGTH
 from web3.providers import AutoProvider
 from web3.providers.auto import load_provider_from_environment
 from web3.types import FeeHistory, RPCEndpoint, TxParams
 
-from ape.api import Address, BlockAPI, ProviderAPI, ReceiptAPI, TraceAPI, TransactionAPI
+from ape.api.address import Address
+from ape.api.providers import BlockAPI, ProviderAPI
+from ape.api.transactions import ReceiptAPI, TransactionAPI
 from ape.exceptions import (
+    _SOURCE_TRACEBACK_ARG,
+    _TRACE_ARG,
     ApeException,
     APINotImplementedError,
     BlockNotFoundError,
@@ -52,24 +60,29 @@ from ape.exceptions import (
     VirtualMachineError,
 )
 from ape.logging import logger, sanitize_url
-from ape.types import (
-    AddressType,
-    AutoGasLimit,
-    BlockID,
-    ContractCode,
-    ContractLog,
-    LogFilter,
-    SourceTraceback,
-)
-from ape.utils import ManagerAccessMixin, gas_estimation_error_message, to_int
-from ape.utils.misc import DEFAULT_MAX_RETRIES_TX
+from ape.types.events import ContractLog, LogFilter
+from ape.types.gas import AutoGasLimit
+from ape.types.trace import SourceTraceback
+from ape.utils._web3_compat import ExtraDataToPOAMiddleware, WebsocketProvider
+from ape.utils.basemodel import ManagerAccessMixin
+from ape.utils.misc import DEFAULT_MAX_RETRIES_TX, gas_estimation_error_message, to_int
+from ape.utils.rpc import request_with_retry
 from ape_ethereum._print import CONSOLE_ADDRESS, console_contract
 from ape_ethereum.trace import CallTrace, TraceApproach, TransactionTrace
 from ape_ethereum.transactions import AccessList, AccessListTransaction, TransactionStatusEnum
 
+if TYPE_CHECKING:
+    from ethpm_types import EventABI
+
+    from ape.api.trace import TraceAPI
+    from ape.types.address import AddressType
+    from ape.types.vm import BlockID, ContractCode
+
+
 DEFAULT_PORT = 8545
 DEFAULT_HOSTNAME = "localhost"
-DEFAULT_SETTINGS = {"uri": f"http://{DEFAULT_HOSTNAME}:{DEFAULT_PORT}"}
+DEFAULT_HTTP_URI = f"http://{DEFAULT_HOSTNAME}:{DEFAULT_PORT}"
+DEFAULT_SETTINGS = {"uri": DEFAULT_HTTP_URI}
 
 
 def _sanitize_web3_url(msg: str) -> str:
@@ -118,6 +131,24 @@ def assert_web3_provider_uri_env_var_not_set():
     )
 
 
+def _post_send_transaction(tx: TransactionAPI, receipt: ReceiptAPI):
+    """Execute post-transaction ops"""
+
+    # TODO: Optional configuration?
+    if tx.receiver and Address(tx.receiver).is_contract:
+        # Look for and print any contract logging
+        try:
+            receipt.show_debug_logs()
+        except TransactionNotFound:
+            # Receipt never published. Likely failed.
+            pass
+        except Exception as err:
+            # Avoid letting debug logs causes program crashes.
+            logger.debug(f"Unable to show debug logs: {err}")
+
+    logger.info(f"Confirmed {receipt.txn_hash} (total fees paid = {receipt.total_fees_paid})")
+
+
 class Web3Provider(ProviderAPI, ABC):
     """
     A base provider mixin class that uses the
@@ -154,7 +185,7 @@ class Web3Provider(ProviderAPI, ABC):
             @wraps(send_tx)
             def send_tx_wrapper(self, txn: TransactionAPI) -> ReceiptAPI:
                 receipt = send_tx(self, txn)
-                self._post_send_transaction(txn, receipt)
+                _post_send_transaction(txn, receipt)
                 return receipt
 
             return send_tx_wrapper
@@ -180,49 +211,218 @@ class Web3Provider(ProviderAPI, ABC):
         raise ProviderNotConnectedError()
 
     @property
-    def http_uri(self) -> Optional[str]:
+    def _network_config(self) -> dict:
+        config: dict = self.config.get(self.network.ecosystem.name, None)
+        if config is None:
+            return {}
+
+        return (config or {}).get(self.network.name) or {}
+
+    def _get_configured_rpc(self, key: str, validator: Callable[[str], bool]) -> Optional[str]:
+        # key = "uri", "http_uri", "ws_uri", or "ipc_path"
+        settings = self.settings  # Includes self.provider_settings and top-level config.
+        result = None
+        rpc: str
+        if rpc := settings.get(key):
+            result = rpc
+
+        else:
+            # See if it was configured for the network directly.
+            config = self._network_config
+            if rpc := config.get(key):
+                result = rpc
+
+        if result:
+            if validator(result):
+                return result
+            else:
+                raise ConfigError(f"Invalid {key}: {result}")
+
+        # Not configured by the user.
+        return None
+
+    @property
+    def _configured_http_uri(self) -> Optional[str]:
+        return self._get_configured_rpc("http_uri", _is_http_url)
+
+    @property
+    def _configured_ws_uri(self) -> Optional[str]:
+        return self._get_configured_rpc("ws_uri", _is_ws_url)
+
+    @property
+    def _configured_ipc_path(self) -> Optional[str]:
+        return self._get_configured_rpc("ipc_path", _is_ipc_path)
+
+    @property
+    def _configured_uri(self) -> Optional[str]:
+        for key in ("uri", "url"):
+            if rpc := self._get_configured_rpc(key, _is_uri):
+                return rpc
+
+        return None
+
+    @property
+    def _configured_rpc(self) -> Optional[str]:
+        """
+        First of URI, HTTP_URI, WS_URI, IPC_PATH
+        found in the provider_settings or config.
+        """
+
+        # NOTE: Even though this only returns 1 value,
+        #   each configured URI is passed in to web3 and
+        #   will be used as each specific types of data
+        #   is requested.
+        if rpc := self._configured_uri:
+            # The user specifically configured "uri:"
+            return rpc
+
+        elif rpc := self._configured_http_uri:
+            # Use their configured HTTP URI.
+            return rpc
+
+        elif rpc := self._configured_ws_uri:
+            # Use their configured WS URI.
+            return rpc
+
+        elif rpc := self._configured_ipc_path:
+            return rpc
+
+        return None
+
+    def _get_connected_rpc(self, validator: Callable[[str], bool]) -> Optional[str]:
         """
         The connected HTTP URI. If using providers
         like `ape-node`, configure your URI and that will
         be returned here instead.
         """
-        try:
-            web3 = self.web3
-        except ProviderNotConnectedError:
-            if uri := getattr(self, "uri", None):
-                if _is_http_url(uri):
-                    return uri
+        if web3 := self._web3:
+            if endpoint_uri := getattr(web3.provider, "endpoint_uri", None):
+                if isinstance(endpoint_uri, str) and validator(endpoint_uri):
+                    return endpoint_uri
 
-            return None
+        return None
 
-        if (
-            hasattr(web3.provider, "endpoint_uri")
-            and isinstance(web3.provider.endpoint_uri, str)
-            and web3.provider.endpoint_uri.startswith("http")
-        ):
-            return web3.provider.endpoint_uri
+    @property
+    def _connected_http_uri(self) -> Optional[str]:
+        return self._get_connected_rpc(_is_http_url)
 
-        if uri := getattr(self, "uri", None):
-            if _is_http_url(uri):
+    @property
+    def _connected_ws_uri(self) -> Optional[str]:
+        return self._get_connected_rpc(_is_ws_url)
+
+    @property
+    def _connected_ipc_path(self) -> Optional[str]:
+        return self._get_connected_rpc(_is_ipc_path)
+
+    @property
+    def _connected_uri(self) -> Optional[str]:
+        return self._get_connected_rpc(_is_uri)
+
+    @property
+    def uri(self) -> str:
+        if rpc := self._connected_uri:
+            # The already connected RPC URI.
+            return rpc
+
+        elif rpc := self._configured_rpc:
+            # Any configured rpc from settings/config.
+            return rpc
+
+        elif rpc := self._default_http_uri:
+            # Default localhost RPC or random chain from `evmchains`
+            # (depending on network).
+            return rpc
+
+        # NOTE: Don't use default IPC path here. IPC must be
+        #   configured if it is the only RPC.
+
+        raise ProviderError(
+            f"Missing URI for network '{self.network.name}' on '{self.network.ecosystem.name}'."
+        )
+
+    @property
+    def network_choice(self) -> str:
+        if uri := self._configured_uri:
+            # Ensure anything using the same choice uses the same RPC.
+            if self.network.name == "custom":
+                # Network was not really specified. Just use URI.
                 return uri
+
+            # User is using a value like `ethereum:mainnet:<uri>` or
+            # configured the URI in their Ape config.
+            return f"{self.network.choice}:{uri}"
+
+        return super().network_choice
+
+    @property
+    def http_uri(self) -> Optional[str]:
+        if rpc := self._connected_http_uri:
+            return rpc
+
+        elif rpc := self._configured_http_uri:
+            return rpc
+
+        elif rpc := self._configured_uri:
+            if _is_http_url(rpc):
+                # "uri" found in config/settings and is WS.
+                return rpc
+
+        return self._default_http_uri
+
+    @property
+    def _default_http_uri(self) -> Optional[str]:
+        if self.network.is_dev:
+            # Nothing is configured and we are running geth --dev.
+            # Use a default localhost value.
+            return DEFAULT_HTTP_URI
+
+        elif rpc := self._get_random_rpc():
+            # This works when the network is in `evmchains`.
+            return rpc
 
         return None
 
     @property
     def ws_uri(self) -> Optional[str]:
-        try:
-            web3 = self.web3
-        except ProviderNotConnectedError:
-            return None
+        if rpc := self._connected_ws_uri:
+            return rpc
 
-        if (
-            hasattr(web3.provider, "endpoint_uri")
-            and isinstance(web3.provider.endpoint_uri, str)
-            and web3.provider.endpoint_uri.startswith("ws")
-        ):
-            return web3.provider.endpoint_uri
+        elif rpc := self._configured_ws_uri:
+            # "ws_uri" found in config/settings
+            return rpc
+
+        elif rpc := self._configured_uri:
+            if _is_ws_url(rpc):
+                # "uri" found in config/settings and is WS.
+                return rpc
 
         return None
+
+    @property
+    def ipc_path(self) -> Optional[Path]:
+        if rpc := self._configured_ipc_path:
+            # "ipc_path" found in config/settings
+            return Path(rpc)
+
+        elif rpc := self._configured_uri:
+            if _is_ipc_path(rpc):
+                # "uri" found in config/settings and is IPC.
+                return Path(rpc)
+
+        return None
+
+    def _get_random_rpc(self) -> Optional[str]:
+        if self.network.is_dev:
+            return None
+
+        ecosystem = self.network.ecosystem.name
+        network = self.network.name
+
+        # Use public RPC if available
+        try:
+            return get_random_rpc(ecosystem, network)
+        except KeyError:
+            return None
 
     @property
     def client_version(self) -> str:
@@ -320,7 +520,7 @@ class Web3Provider(ProviderAPI, ABC):
         self.provider_settings.update(new_settings)
         self.connect()
 
-    def estimate_gas_cost(self, txn: TransactionAPI, block_id: Optional[BlockID] = None) -> int:
+    def estimate_gas_cost(self, txn: TransactionAPI, block_id: Optional["BlockID"] = None) -> int:
         # NOTE: Using JSON mode since used as request data.
         txn_dict = txn.model_dump(by_alias=True, mode="json")
 
@@ -374,19 +574,27 @@ class Web3Provider(ProviderAPI, ABC):
     @cached_property
     def chain_id(self) -> int:
         default_chain_id = None
-        if self.network.name != "custom" and not self.network.is_dev:
+        if (not self.network.is_adhoc and self.network.is_custom) or not self.network.is_dev:
             # If using a live network, the chain ID is hardcoded.
             default_chain_id = self.network.chain_id
 
         try:
             if hasattr(self.web3, "eth"):
-                return self.web3.eth.chain_id
+                return self._get_chain_id()
 
         except ProviderNotConnectedError:
             if default_chain_id is not None:
                 return default_chain_id
 
             raise  # Original error
+
+        except ValueError as err:
+            # Possible syncing error.
+            raise ProviderError(
+                err.args[0].get("message")
+                if all((hasattr(err, "args"), err.args, isinstance(err.args[0], dict)))
+                else "Error getting chain ID."
+            )
 
         if default_chain_id is not None:
             return default_chain_id
@@ -408,7 +616,11 @@ class Web3Provider(ProviderAPI, ABC):
                 "eth_maxPriorityFeePerGas not supported in this RPC. Please specify manually."
             ) from err
 
-    def get_block(self, block_id: BlockID) -> BlockAPI:
+    def _get_chain_id(self) -> int:
+        result = self.make_request("eth_chainId", [])
+        return result if isinstance(result, int) else int(result, 16)
+
+    def get_block(self, block_id: "BlockID") -> BlockAPI:
         if isinstance(block_id, str) and block_id.isnumeric():
             block_id = int(block_id)
 
@@ -427,17 +639,19 @@ class Web3Provider(ProviderAPI, ABC):
     def _get_latest_block_rpc(self) -> dict:
         return self.make_request("eth_getBlockByNumber", ["latest", False])
 
-    def get_nonce(self, address: AddressType, block_id: Optional[BlockID] = None) -> int:
+    def get_nonce(self, address: "AddressType", block_id: Optional["BlockID"] = None) -> int:
         return self.web3.eth.get_transaction_count(address, block_identifier=block_id)
 
-    def get_balance(self, address: AddressType, block_id: Optional[BlockID] = None) -> int:
+    def get_balance(self, address: "AddressType", block_id: Optional["BlockID"] = None) -> int:
         return self.web3.eth.get_balance(address, block_identifier=block_id)
 
-    def get_code(self, address: AddressType, block_id: Optional[BlockID] = None) -> ContractCode:
+    def get_code(
+        self, address: "AddressType", block_id: Optional["BlockID"] = None
+    ) -> "ContractCode":
         return self.web3.eth.get_code(address, block_identifier=block_id)
 
     def get_storage(
-        self, address: AddressType, slot: int, block_id: Optional[BlockID] = None
+        self, address: "AddressType", slot: int, block_id: Optional["BlockID"] = None
     ) -> HexBytes:
         try:
             return HexBytes(self.web3.eth.get_storage_at(address, slot, block_identifier=block_id))
@@ -447,7 +661,7 @@ class Web3Provider(ProviderAPI, ABC):
 
             raise  # Raise original error
 
-    def get_transaction_trace(self, transaction_hash: str, **kwargs) -> TraceAPI:
+    def get_transaction_trace(self, transaction_hash: str, **kwargs) -> "TraceAPI":
         if transaction_hash in self._transaction_trace_cache:
             return self._transaction_trace_cache[transaction_hash]
 
@@ -461,7 +675,7 @@ class Web3Provider(ProviderAPI, ABC):
     def send_call(
         self,
         txn: TransactionAPI,
-        block_id: Optional[BlockID] = None,
+        block_id: Optional["BlockID"] = None,
         state: Optional[dict] = None,
         **kwargs: Any,
     ) -> HexBytes:
@@ -692,7 +906,7 @@ class Web3Provider(ProviderAPI, ABC):
         data = {"provider": self, **kwargs}
         return self.network.ecosystem.decode_receipt(data)
 
-    def get_transactions_by_block(self, block_id: BlockID) -> Iterator[TransactionAPI]:
+    def get_transactions_by_block(self, block_id: "BlockID") -> Iterator[TransactionAPI]:
         if isinstance(block_id, str):
             block_id = HexStr(block_id)
 
@@ -705,7 +919,7 @@ class Web3Provider(ProviderAPI, ABC):
 
     def get_transactions_by_account_nonce(
         self,
-        account: AddressType,
+        account: "AddressType",
         start_nonce: int = 0,
         stop_nonce: int = -1,
     ) -> Iterator[ReceiptAPI]:
@@ -730,7 +944,7 @@ class Web3Provider(ProviderAPI, ABC):
 
     def _find_txn_by_account_and_nonce(
         self,
-        account: AddressType,
+        account: "AddressType",
         start_nonce: int,
         stop_nonce: int,
         start_block: int,
@@ -876,11 +1090,11 @@ class Web3Provider(ProviderAPI, ABC):
     def poll_logs(
         self,
         stop_block: Optional[int] = None,
-        address: Optional[AddressType] = None,
+        address: Optional["AddressType"] = None,
         topics: Optional[list[Union[str, list[str]]]] = None,
         required_confirmations: Optional[int] = None,
         new_block_timeout: Optional[int] = None,
-        events: Optional[list[EventABI]] = None,
+        events: Optional[list["EventABI"]] = None,
     ) -> Iterator[ContractLog]:
         events = events or []
         if required_confirmations is None:
@@ -998,35 +1212,9 @@ class Web3Provider(ProviderAPI, ABC):
     def send_transaction(self, txn: TransactionAPI) -> ReceiptAPI:
         vm_err = None
         txn_data = None
-        txn_hash = None
         try:
-            if txn.sender is not None and txn.signature is None:
-                # Missing signature, user likely trying to use an unlocked account.
-                attempt_send = True
-                if (
-                    self.network.is_dev
-                    and txn.sender not in self.account_manager.test_accounts._impersonated_accounts
-                ):
-                    try:
-                        self.account_manager.test_accounts.impersonate_account(txn.sender)
-                    except NotImplementedError:
-                        # Unable to impersonate. Try sending as raw-tx.
-                        attempt_send = False
-
-                if attempt_send:
-                    # For some reason, some nodes have issues with integer-types.
-                    txn_data = {
-                        k: to_hex(v) if isinstance(v, int) else v
-                        for k, v in txn.model_dump(by_alias=True, mode="json").items()
-                    }
-                    tx_params = cast(TxParams, txn_data)
-                    txn_hash = to_hex(self.web3.eth.send_transaction(tx_params))
-                # else: attempt raw tx
-
-            if txn_hash is None:
-                txn_hash = to_hex(self.web3.eth.send_raw_transaction(txn.serialize_transaction()))
-
-        except (ValueError, Web3ContractLogicError, Web3RPCError) as err:
+            txn_hash = self._send_transaction(txn)
+        except (Web3RPCError, Web3ContractLogicError) as err:
             vm_err = self.get_virtual_machine_error(
                 err, txn=txn, set_ape_traceback=txn.raise_on_revert
             )
@@ -1041,12 +1229,17 @@ class Web3Provider(ProviderAPI, ABC):
             else self.network.required_confirmations
         )
         txn_data = txn_data or txn.model_dump(by_alias=True, mode="json")
-        if vm_err:
+
+        # Signature is excluded from the model fields, so we have to include it manually.
+        txn_data["signature"] = txn.signature
+
+        manual_mining = not getattr(self, "auto_mine", True)
+        if vm_err or manual_mining:
             receipt = self._create_receipt(
                 block_number=-1,  # Not in a block.
                 error=vm_err,
                 required_confirmations=required_confirmations,
-                status=TransactionStatusEnum.FAILING,
+                status=TransactionStatusEnum.FAILING if vm_err else TransactionStatusEnum.NO_ERROR,
                 txn_hash=txn_hash,
                 **txn_data,
             )
@@ -1069,6 +1262,9 @@ class Web3Provider(ProviderAPI, ABC):
             # NOTE: For some reason, some providers have issues with
             #   `nonce`, it's not needed anyway.
             txn_data.pop("nonce", None)
+
+            # Signature causes issues when making call (instead of tx)
+            txn_data.pop("signature", None)
 
             # NOTE: Using JSON mode since used as request data.
             txn_params = cast(TxParams, txn_data)
@@ -1094,30 +1290,50 @@ class Web3Provider(ProviderAPI, ABC):
 
         return receipt
 
-    def _post_send_transaction(self, tx: TransactionAPI, receipt: ReceiptAPI):
-        """Execute post-transaction ops"""
+    def _send_transaction(self, txn: TransactionAPI) -> str:
+        txn_hash = None
+        if txn.sender is not None and txn.signature is None:
+            # Missing signature, user likely trying to use an unlocked account.
+            attempt_send = True
+            if (
+                self.network.is_dev
+                and txn.sender not in self.account_manager.test_accounts._impersonated_accounts
+            ):
+                try:
+                    self.account_manager.test_accounts.impersonate_account(txn.sender)
+                except NotImplementedError:
+                    # Unable to impersonate. Try sending as raw-tx.
+                    attempt_send = False
 
-        # TODO: Optional configuration?
-        if tx.receiver and Address(tx.receiver).is_contract:
-            # Look for and print any contract logging
-            try:
-                receipt.show_debug_logs()
-            except TransactionNotFound:
-                # Receipt never published. Likely failed.
-                pass
-            except Exception as err:
-                # Avoid letting debug logs causes program crashes.
-                logger.debug(f"Unable to show debug logs: {err}")
+            if attempt_send:
+                # For some reason, some nodes have issues with integer-types.
+                txn_data = {
+                    k: to_hex(v) if isinstance(v, int) else v
+                    for k, v in txn.model_dump(by_alias=True, mode="json").items()
+                }
+                tx_params = cast(TxParams, txn_data)
+                txn_hash = to_hex(self.web3.eth.send_transaction(tx_params))
+            # else: attempt raw tx
 
-        logger.info(f"Confirmed {receipt.txn_hash} (total fees paid = {receipt.total_fees_paid})")
+        if txn_hash is None:
+            txn_hash = to_hex(self.web3.eth.send_raw_transaction(txn.serialize_transaction()))
+
+        return txn_hash
 
     def _post_connect(self):
         # Register the console contract for trace enrichment
-        self.chain_manager.contracts._cache_contract_type(CONSOLE_ADDRESS, console_contract)
+        self.chain_manager.contracts.cache_contract_type(
+            CONSOLE_ADDRESS,
+            console_contract,
+            ecosystem_key=self.network.ecosystem.name,
+            network_key=self.network.name,
+        )
 
     def make_request(self, rpc: str, parameters: Optional[Iterable] = None) -> Any:
-        parameters = parameters or []
+        return request_with_retry(lambda: self._make_request(rpc, parameters=parameters))
 
+    def _make_request(self, rpc: str, parameters: Optional[Iterable] = None) -> Any:
+        parameters = parameters or []
         try:
             result = self.web3.provider.make_request(RPCEndpoint(rpc), parameters)
         except HTTPError as err:
@@ -1125,6 +1341,9 @@ class Web3Provider(ProviderAPI, ABC):
                 raise APINotImplementedError(
                     f"RPC method '{rpc}' is not implemented by this node instance."
                 )
+
+            elif err.response.status_code == 429:
+                raise  # Raise as-is so rate-limit handling picks it up.
 
             raise ProviderError(str(err)) from err
 
@@ -1167,7 +1386,7 @@ class Web3Provider(ProviderAPI, ABC):
             del results[:]
 
     def create_access_list(
-        self, transaction: TransactionAPI, block_id: Optional[BlockID] = None
+        self, transaction: TransactionAPI, block_id: Optional["BlockID"] = None
     ) -> list[AccessList]:
         """
         Get the access list for a transaction use ``eth_createAccessList``.
@@ -1245,9 +1464,9 @@ class Web3Provider(ProviderAPI, ABC):
         self,
         exception: Union[Exception, str],
         txn: Optional[TransactionAPI] = None,
-        trace: Optional[TraceAPI] = None,
-        contract_address: Optional[AddressType] = None,
-        source_traceback: Optional[SourceTraceback] = None,
+        trace: _TRACE_ARG = None,
+        contract_address: Optional["AddressType"] = None,
+        source_traceback: _SOURCE_TRACEBACK_ARG = None,
         set_ape_traceback: Optional[bool] = None,
     ) -> ContractLogicError:
         if hasattr(exception, "args") and len(exception.args) == 2:
@@ -1277,10 +1496,13 @@ class Web3Provider(ProviderAPI, ABC):
                 if trace is None and txn is not None:
                     trace = self.provider.get_transaction_trace(to_hex(txn.txn_hash))
 
-                if trace is not None and (revert_message := trace.revert_message):
-                    message = revert_message
-                    no_reason = False
-                    if revert_message := trace.revert_message:
+                if trace is not None:
+                    if callable(trace):
+                        trace_called = params["trace"] = trace()
+                    else:
+                        trace_called = trace
+
+                    if trace_called is not None and (revert_message := trace_called.revert_message):
                         message = revert_message
                         no_reason = False
 
@@ -1315,97 +1537,7 @@ class EthereumNodeProvider(Web3Provider, ABC):
     name: str = "node"
 
     # NOTE: Appends user-agent to base User-Agent string.
-    request_header: dict = HTTPProvider.get_request_headers()
-
-    @property
-    def uri(self) -> str:
-        if "url" in self.provider_settings:
-            raise ConfigError("Unknown provider setting 'url'. Did you mean 'uri'?")
-        elif uri := self.provider_settings.get("uri"):
-            if _is_uri(uri):
-                return uri
-            else:
-                raise TypeError(f"Not an URI: {uri}")
-
-        config = self.config.model_dump().get(self.network.ecosystem.name, None)
-        if config is None:
-            if rpc := self._get_random_rpc():
-                return rpc
-            elif self.network.is_dev:
-                return DEFAULT_SETTINGS["uri"]
-
-            # We have no way of knowing what URL the user wants.
-            raise ProviderError(f"Please configure a URL for '{self.network_choice}'.")
-
-        # Use value from config file
-        network_config = config.get(self.network.name) or DEFAULT_SETTINGS
-
-        if "url" in network_config:
-            raise ConfigError("Unknown provider setting 'url'. Did you mean 'uri'?")
-        elif "http_uri" in network_config:
-            key = "http_uri"
-        elif "uri" in network_config:
-            key = "uri"
-        elif "ipc_path" in network_config:
-            key = "ipc_path"
-        elif "ws_uri" in network_config:
-            key = "ws_uri"
-        elif rpc := self._get_random_rpc():
-            return rpc
-        else:
-            key = "uri"
-
-        settings_uri = network_config.get(key, DEFAULT_SETTINGS["uri"])
-        if _is_uri(settings_uri):
-            return settings_uri
-
-        # Likely was an IPC Path (or websockets) and will connect that way.
-        return super().http_uri or ""
-
-    @property
-    def http_uri(self) -> Optional[str]:
-        uri = self.uri
-        return uri if _is_http_url(uri) else None
-
-    @property
-    def ws_uri(self) -> Optional[str]:
-        if "ws_uri" in self.provider_settings:
-            # Use adhoc, scripted value
-            return self.provider_settings["ws_uri"]
-
-        elif "uri" in self.provider_settings and _is_ws_url(self.provider_settings["uri"]):
-            return self.provider_settings["uri"]
-
-        config: dict = self.config.get(self.network.ecosystem.name, {})
-        if config == {}:
-            return super().ws_uri
-
-        # Use value from config file
-        network_config = config.get(self.network.name) or DEFAULT_SETTINGS
-        if "ws_uri" not in network_config:
-            if "uri" in network_config and _is_ws_url(network_config["uri"]):
-                return network_config["uri"]
-
-            return super().ws_uri
-
-        settings_uri = network_config.get("ws_uri")
-        if settings_uri and _is_ws_url(settings_uri):
-            return settings_uri
-
-        return super().ws_uri
-
-    def _get_random_rpc(self) -> Optional[str]:
-        if self.network.is_dev:
-            return None
-
-        ecosystem = self.network.ecosystem.name
-        network = self.network.name
-
-        # Use public RPC if available
-        try:
-            return get_random_rpc(ecosystem, network)
-        except KeyError:
-            return None
+    request_header: dict = {"User-Agent": f"EthereumNodeProvider/web3.py/{web3_version}"}
 
     @property
     def connection_str(self) -> str:
@@ -1421,29 +1553,19 @@ class EthereumNodeProvider(Web3Provider, ABC):
         return sanitize_url(uri) if _is_http_url(uri) or _is_ws_url(uri) else uri
 
     @property
-    def ipc_path(self) -> Path:
-        if ipc := self.settings.ipc_path:
-            return ipc
-
-        config: dict = self.config.get(self.network.ecosystem.name, {})
-        network_config = config.get(self.network.name, {})
-        if ipc := network_config.get("ipc_path"):
-            return Path(ipc)
-
-        # Check `uri:` config.
-        uri = self.uri
-        if _is_ipc_path(uri):
-            return Path(uri)
-
-        # Default (used by geth-process).
-        return self.data_dir / "geth.ipc"
-
-    @property
     def data_dir(self) -> Path:
         if self.settings.data_dir:
             return self.settings.data_dir.expanduser()
 
         return _get_default_data_dir()
+
+    @property
+    def ipc_path(self) -> Path:
+        if path := super().ipc_path:
+            return path
+
+        # Default (used by geth-process).
+        return self.data_dir / "geth.ipc"
 
     @cached_property
     def _ots_api_level(self) -> Optional[int]:
@@ -1495,25 +1617,25 @@ class EthereumNodeProvider(Web3Provider, ABC):
         if not self.network.is_dev:
             self.web3.eth.set_gas_price_strategy(rpc_gas_price_strategy)
 
-        # Check for chain errors, including syncing
-        try:
-            chain_id = self.web3.eth.chain_id
-        except ValueError as err:
-            raise ProviderError(
-                err.args[0].get("message")
-                if all((hasattr(err, "args"), err.args, isinstance(err.args[0], dict)))
-                else "Error getting chain id."
-            )
+        chain_id = self.chain_id
 
         # NOTE: We have to check both earliest and latest
         #   because if the chain was _ever_ PoA, we need
         #   this middleware.
+        is_likely_poa = False
         for option in ("earliest", "latest"):
             try:
                 block = self.web3.eth.get_block(option)  # type: ignore[arg-type]
+
             except ExtraDataLengthError:
                 is_likely_poa = True
                 break
+
+            except Exception:
+                # Some chains are "light" and we may not be able to detect
+                # if it needs PoA middleware.
+                continue
+
             else:
                 is_likely_poa = (
                     "proofOfAuthorityData" in block
@@ -1526,6 +1648,18 @@ class EthereumNodeProvider(Web3Provider, ABC):
             self.web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
         self.network.verify_chain_id(chain_id)
+
+        # Correct network name, if using custom-URL approach.
+        if self.network.name == "custom":
+            for ecosystem_name, network in PUBLIC_CHAIN_META.items():
+                for network_name, meta in network.items():
+                    if "chainId" not in meta or meta["chainId"] != chain_id:
+                        continue
+
+                    # Network found.
+                    self.network.name = network_name
+                    self.network.ecosystem.name = ecosystem_name
+                    break
 
     def disconnect(self):
         self._call_trace_approach = None
@@ -1541,7 +1675,7 @@ class EthereumNodeProvider(Web3Provider, ABC):
         )
         logger.info(f"{msg} {suffix}.")
 
-    def ots_get_contract_creator(self, address: AddressType) -> Optional[dict]:
+    def ots_get_contract_creator(self, address: "AddressType") -> Optional[dict]:
         if self._ots_api_level is None:
             return None
 
@@ -1552,7 +1686,7 @@ class EthereumNodeProvider(Web3Provider, ABC):
 
         return result
 
-    def _get_contract_creation_receipt(self, address: AddressType) -> Optional[ReceiptAPI]:
+    def _get_contract_creation_receipt(self, address: "AddressType") -> Optional[ReceiptAPI]:
         if result := self.ots_get_contract_creator(address):
             tx_hash = result["hash"]
             return self.get_receipt(tx_hash)
@@ -1587,7 +1721,7 @@ def _create_web3(
 
         providers.append(lambda: HTTPProvider(endpoint_uri=http, request_kwargs=request_kwargs))
     if ws := ws_uri:
-        providers.append(lambda: WebSocketProvider(endpoint_uri=ws))
+        providers.append(lambda: WebsocketProvider(endpoint_uri=ws))
 
     provider = AutoProvider(potential_providers=providers)
     return Web3(provider)
@@ -1623,8 +1757,8 @@ def _is_ws_url(val: str) -> bool:
     return val.startswith("wss://") or val.startswith("ws://")
 
 
-def _is_ipc_path(val: str) -> bool:
-    return val.endswith(".ipc")
+def _is_ipc_path(val: Union[str, Path]) -> bool:
+    return f"{val}".endswith(".ipc")
 
 
 class _LazyCallTrace(ManagerAccessMixin):

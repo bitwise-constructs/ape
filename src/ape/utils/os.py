@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import stat
 import sys
 import tarfile
 import zipfile
@@ -34,7 +36,12 @@ def get_relative_path(target: Path, anchor: Path) -> Path:
     Compute the relative path of ``target`` relative to ``anchor``,
     which may or may not share a common ancestor.
 
-    **NOTE**: Both paths must be absolute.
+    **NOTE ON PERFORMANCE**: Both paths must be absolute to
+    use this method. If you know both methods are absolute,
+    this method is a performance boost. If you have to first
+    call `.absolute()` on the paths, use
+    `target.relative_to(anchor)` instead; as it will be
+    faster in that case.
 
     Args:
         target (pathlib.Path): The path we are interested in.
@@ -43,11 +50,6 @@ def get_relative_path(target: Path, anchor: Path) -> Path:
     Returns:
         pathlib.Path: The new path to the target path from the anchor path.
     """
-    if not target.is_absolute():
-        raise ValueError("'target' must be an absolute path.")
-    if not anchor.is_absolute():
-        raise ValueError("'anchor' must be an absolute path.")
-
     # Calculate common prefix length
     common_parts = 0
     for target_part, anchor_part in zip(target.parts, anchor.parts):
@@ -211,12 +213,7 @@ def create_tempdir(name: Optional[str] = None) -> Iterator[Path]:
 
 
 def run_in_tempdir(
-    fn: Callable[
-        [
-            Path,
-        ],
-        Any,
-    ],
+    fn: Callable[[Path], Any],
     name: Optional[str] = None,
 ):
     """
@@ -374,3 +371,95 @@ def extract_archive(archive_file: Path, destination: Optional[Path] = None):
 
     else:
         raise ValueError(f"Unsupported zip format: '{archive_file.suffix}'.")
+
+
+def _remove_readonly(func, path, excinfo):
+    """
+    Error handler for shutil.rmtree that handles removing read-only files.
+    """
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+class CacheDirectory:
+    """
+    A directory for caching data where each data item is named
+    ``<key>.json`` and is in the directory. You can access the
+    items by their key like a dictionary. This type is used
+    in Ape's contract-caching for ContractTypes, ProxyInfoAPI,
+    and other model types.
+    """
+
+    def __init__(self, path: Path):
+        if path.is_file():
+            raise ValueError("Expecting directory.")
+
+        self._path = path
+
+    def __getitem__(self, key: str) -> dict:
+        """
+        Get the data from ``base_path / <key>.json``.
+
+        Returns:
+            The JSON dictionary
+        """
+        return self.get_data(key)
+
+    def __setitem__(self, key: str, value: dict):
+        """
+        Cache the given data to ``base_path / <key>.json``.
+
+        Args:
+            key (str): The key, used as the file name ``{key}.json``.
+            value (dict): The JSON dictionary to cache.
+        """
+        self.cache_data(key, value)
+
+    def __delitem__(self, key: str):
+        """
+        Delete the cache-file.
+
+        Args:
+            key (str): The file stem of the JSON.
+        """
+        self.delete_data(key)
+
+    def get_file(self, key: str) -> Path:
+        return self._path / f"{key}.json"
+
+    def cache_data(self, key: str, data: dict):
+        json_str = json.dumps(data)
+        file = self.get_file(key)
+        file.unlink(missing_ok=True)
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(json_str)
+
+    def get_data(self, key: str) -> dict:
+        file = self.get_file(key)
+        if not file.is_file():
+            return {}
+
+        json_str = file.read_text(encoding="utf8")
+        return json.loads(json_str)
+
+    def delete_data(self, key: str):
+        file = self.get_file(key)
+        file.unlink(missing_ok=True)
+
+
+@contextmanager
+def within_directory(directory: Path):
+    """
+    A context-manager for changing the cwd to the given path.
+
+    Args:
+        directory (Path): The directory to change.
+    """
+    here = Path.cwd()
+    if directory != here:
+        os.chdir(directory)
+    try:
+        yield
+    finally:
+        if Path.cwd() != here:
+            os.chdir(here)
