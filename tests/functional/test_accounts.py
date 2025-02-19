@@ -20,6 +20,7 @@ from ape.exceptions import (
 )
 from ape.types.gas import AutoGasLimit
 from ape.types.signatures import recover_signer
+from ape.utils.testing import DEFAULT_TEST_MNEMONIC
 from ape_accounts.accounts import (
     KeyfileAccount,
     generate_account,
@@ -118,7 +119,7 @@ def test_sign_message_with_prompts(runner, keyfile_account, message):
 
 def test_sign_raw_hash(runner, keyfile_account):
     # NOTE: `message` is a 32 byte raw hash, which is treated specially
-    message = b"\xAB" * 32
+    message = b"\xab" * 32
 
     # "y\na\ny": yes sign raw hash, password, yes keep unlocked
     with runner.isolation(input=f"y\n{PASSPHRASE}\ny"):
@@ -494,7 +495,7 @@ def test_autosign_transactions(runner, keyfile_account, receiver):
 
 def test_impersonate_not_implemented(accounts, address):
     expected_err_msg = (
-        r"Your provider does not support impersonating accounts:\\n"
+        r"Provider 'test' does not support impersonating accounts:\\n"
         rf"No account with address '{address}'\."
     )
     with pytest.raises(KeyError, match=expected_err_msg):
@@ -521,7 +522,7 @@ def test_impersonated_account_ignores_signature_check_on_txn(accounts, address):
 
 def test_contract_as_sender_non_fork_network(contract_instance):
     expected_err_msg = (
-        r"Your provider does not support impersonating accounts:\\n"
+        r"Provider 'test' does not support impersonating accounts:\\n"
         rf"No account with address '{contract_instance}'\."
     )
     with pytest.raises(KeyError, match=expected_err_msg):
@@ -696,18 +697,26 @@ def test_using_different_hd_path(accounts, project, eth_tester_provider):
     assert old_address != new_address
 
 
-def test_using_random_mnemonic(accounts, project, eth_tester_provider):
-    mnemonic = "candy maple cake sugar pudding cream honey rich smooth crumble sweet treat"
-    test_config = {"test": {"mnemonic": mnemonic}}
+def test_mnemonic(accounts):
+    actual = accounts.mnemonic
+    expected = DEFAULT_TEST_MNEMONIC
+    assert actual == expected
 
-    old_address = accounts[0].address
-    original_settings = eth_tester_provider.settings.model_dump(by_alias=True)
-    with project.temp_config(**test_config):
-        eth_tester_provider.update_settings(test_config["test"])
-        new_address = accounts[0].address
 
-    eth_tester_provider.update_settings(original_settings)
-    assert old_address != new_address
+def test_mnemonic_setter(accounts):
+    original_mnemonic = accounts.mnemonic
+    new_mnemonic = "candy maple cake sugar pudding cream honey rich smooth crumble sweet treat"
+    original_address = accounts[0].address
+
+    # Change.
+    accounts.mnemonic = new_mnemonic
+    new_address = accounts[0].address
+
+    # Put back.
+    accounts.mnemonic = original_mnemonic
+
+    # Assert.
+    assert new_address != original_address
 
 
 def test_iter_test_accounts(accounts):
@@ -995,3 +1004,33 @@ def test_call_sign_false(owner, vyper_contract_instance):
     tx = vyper_contract_instance.setNumber.as_transaction(5991)
     with pytest.raises(SignatureError):
         owner.call(tx, sign=False)
+
+
+def test_resolve_address(owner, keyfile_account, account_manager, vyper_contract_instance):
+    # Test test-account alias input.
+    actual = account_manager.resolve_address(owner.alias)
+    assert actual == owner.address
+
+    # Test keyfile-account alias input.
+    actual = account_manager.resolve_address(keyfile_account.alias)
+    assert actual == keyfile_account.address
+
+    # Test address input.
+    actual = account_manager.resolve_address(owner.address)
+    assert actual == owner.address
+
+    # Test account input.
+    actual = account_manager.resolve_address(owner)
+    assert actual == owner.address
+
+    # Test contract input.
+    actual = account_manager.resolve_address(vyper_contract_instance)
+    assert actual == vyper_contract_instance.address
+
+    # Test int input.
+    actual = account_manager.resolve_address(int(owner.address, 16))
+    assert actual == owner.address
+
+    # Test int input.
+    actual = account_manager.resolve_address(HexBytes(owner.address))
+    assert actual == owner.address

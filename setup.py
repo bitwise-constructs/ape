@@ -22,8 +22,8 @@ extras_require = {
         "hypothesis-jsonschema==0.19.0",  # JSON Schema fuzzer extension
     ],
     "lint": [
-        "black>=24.10.0,<25",  # Auto-formatter and linter
-        "mypy>=1.14.1,<1.15.0",  # Static type analyzer
+        "black>=25.1.0,<26",  # Auto-formatter and linter
+        "mypy>=1.15.0,<1.16.0",  # Static type analyzer
         "types-PyYAML",  # Needed due to mypy typeshed
         "types-requests",  # Needed due to mypy typeshed
         "types-setuptools",  # Needed due to mypy typeshed
@@ -36,8 +36,8 @@ extras_require = {
         "flake8-print>=4.0.1,<5",  # Detect print statements left in code
         "flake8-pydantic",  # For detecting issues with Pydantic models
         "flake8-type-checking",  # Detect imports to move in/out of type-checking blocks
-        "isort>=5.13.2,<6",  # Import sorting linter
-        "mdformat>=0.7.19",  # Auto-formatter for markdown
+        "isort>=6.0.0,<7",  # Import sorting linter
+        "mdformat>=0.7.22",  # Auto-formatter for markdown
         "mdformat-gfm>=0.3.5",  # Needed for formatting GitHub-flavored markdown
         "mdformat-frontmatter>=0.4.1",  # Needed for frontmatters-style headers in issue templates
         "mdformat-pyproject>=0.0.2",  # Allows configuring in pyproject.toml
@@ -128,7 +128,7 @@ setup(
         "web3[tester]>=6.20.1,<8",
         # ** Dependencies maintained by ApeWorX **
         "eip712>=0.2.10,<0.3",
-        "ethpm-types>=0.6.19,<0.7",
+        "ethpm-types>=0.6.23,<0.7",
         "eth_pydantic_types>=0.1.3,<0.2",
         "evmchains>=0.1.0,<0.2",
         "evm-trace>=0.2.3,<0.3",

@@ -29,6 +29,11 @@ from ape.types.address import AddressType
 from ape.types.signatures import MessageSignature, SignableMessage
 from ape.utils.basemodel import BaseInterfaceModel
 from ape.utils.misc import raises_not_implemented
+from ape.utils.testing import (
+    DEFAULT_NUMBER_OF_TEST_ACCOUNTS,
+    DEFAULT_TEST_HD_PATH,
+    DEFAULT_TEST_MNEMONIC,
+)
 
 if TYPE_CHECKING:
     from eth_pydantic_types import HexBytes
@@ -183,7 +188,7 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
         if sign:
             prepared_txn = self.sign_transaction(txn, **signer_options)
             if not prepared_txn:
-                raise SignatureError("The transaction was not signed.")
+                raise SignatureError("The transaction was not signed.", transaction=txn)
 
         else:
             prepared_txn = txn
@@ -396,44 +401,6 @@ class AccountAPI(BaseInterfaceModel, BaseAddress):
         else:
             raise AccountsError(f"Unsupported message type: {type(data)}.")
 
-    def prepare_transaction(self, txn: TransactionAPI) -> TransactionAPI:
-        """
-        Set default values on a transaction.
-
-        Raises:
-            :class:`~ape.exceptions.AccountsError`: When the account cannot afford the transaction
-              or the nonce is invalid.
-            :class:`~ape.exceptions.TransactionError`: When given negative required confirmations.
-
-        Args:
-            txn (:class:`~ape.api.transactions.TransactionAPI`): The transaction to prepare.
-
-        Returns:
-            :class:`~ape.api.transactions.TransactionAPI`
-        """
-
-        # NOTE: Allow overriding nonce, assume user understands what this does
-        if txn.nonce is None:
-            txn.nonce = self.nonce
-        elif txn.nonce < self.nonce:
-            raise AccountsError("Invalid nonce, will not publish.")
-
-        txn = self.provider.prepare_transaction(txn)
-
-        if (
-            txn.sender not in self.account_manager.test_accounts._impersonated_accounts
-            and txn.total_transfer_value > self.balance
-        ):
-            raise AccountsError(
-                f"Transfer value meets or exceeds account balance "
-                f"for account '{self.address}' on chain '{self.provider.chain_id}' "
-                f"using provider '{self.provider.name}'.\n"
-                "Are you using the correct account / chain / provider combination?\n"
-                f"(transfer_value={txn.total_transfer_value}, balance={self.balance})."
-            )
-
-        return txn
-
     def get_deployment_address(self, nonce: Optional[int] = None) -> AddressType:
         """
         Get a contract address before it is deployed. This is useful
@@ -625,6 +592,30 @@ class TestAccountContainerAPI(AccountContainerAPI):
     :class:`~ape.utils.GeneratedDevAccounts`) should implement this API instead of
     ``AccountContainerAPI`` directly. Then, they show up in the ``accounts`` test fixture.
     """
+
+    @property
+    def mnemonic(self) -> str:
+        return self.config_manager.test.get("mnemonic", DEFAULT_TEST_MNEMONIC)
+
+    @mnemonic.setter
+    def mnemonic(self, value: str):
+        self.config_manager.test.mnemonic = value
+
+    @property
+    def number_of_accounts(self) -> int:
+        return self.config_manager.test.get("number_of_accounts", DEFAULT_NUMBER_OF_TEST_ACCOUNTS)
+
+    @number_of_accounts.setter
+    def number_of_accounts(self, value: int):
+        self.config_manager.test.number_of_accounts = value
+
+    @property
+    def hd_path(self) -> str:
+        return self.config_manager.test.get("hd_path", DEFAULT_TEST_HD_PATH)
+
+    @hd_path.setter
+    def hd_path(self, value: str):
+        self.config_manager.test.hd_path = value
 
     @cached_property
     def data_folder(self) -> Path:

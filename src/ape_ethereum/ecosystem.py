@@ -505,8 +505,10 @@ class Ethereum(EcosystemAPI):
             try:
                 # TODO perf: use a batch call here when ape adds support
                 storage = self.provider.get_storage(address, slot)
-            except APINotImplementedError:
-                continue
+            except NotImplementedError:
+                # Break early on not-implemented error rather than attempting
+                # to try more proxy types.
+                break
 
             if sum(storage) == 0:
                 continue
@@ -1027,6 +1029,7 @@ class Ethereum(EcosystemAPI):
                     converted_arguments[key] = value
 
             yield ContractLog(
+                _abi=abi,
                 block_hash=log.get("blockHash") or log.get("block_hash") or "",
                 block_number=log.get("blockNumber") or log.get("block_number") or 0,
                 contract_address=self.decode_address(log["address"]),

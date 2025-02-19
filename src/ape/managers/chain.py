@@ -937,7 +937,36 @@ class ChainManager(BaseManager):
             self.pending_timestamp += deltatime
         self.provider.mine(num_blocks)
 
-    def set_balance(self, account: Union[BaseAddress, AddressType], amount: Union[int, str]):
+    def get_balance(
+        self, address: Union[BaseAddress, AddressType, str], block_id: Optional["BlockID"] = None
+    ) -> int:
+        """
+        Get the balance of the given address. If ``ape-ens`` is installed,
+        you can pass ENS names.
+
+        Args:
+            address (BaseAddress, AddressType | str): An address, ENS, or account/contract.
+            block_id (:class:`~ape.types.BlockID` | None): The block ID. Defaults to latest.
+
+        Returns:
+            int: The account balance.
+        """
+        if (isinstance(address, str) and not address.startswith("0x")) or not isinstance(
+            address, str
+        ):
+            # Handles accounts, ENS, integers, aliases, everything.
+            address = self.account_manager.resolve_address(address)
+
+        return self.provider.get_balance(address, block_id=block_id)
+
+    def set_balance(self, account: Union[BaseAddress, AddressType, str], amount: Union[int, str]):
+        """
+        Set an account balance, only works on development chains.
+
+        Args:
+            account (BaseAddress, AddressType | str): The account.
+            amount (int | str): The new balance.
+        """
         if isinstance(account, BaseAddress):
             account = account.address
 
